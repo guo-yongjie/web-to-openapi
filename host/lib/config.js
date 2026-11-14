@@ -85,9 +85,9 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 const SERVICE = "web-to-openapi";
-// 本地加固版本号(v1.8.0: 可信动作层 act/observe+click+type, 带回执与门禁)。
+// 本地加固版本号(v1.8.1: 修 install-host 写独立 manifest, 修复本机 host 起不来的回归)。
 // 上游发版时请核对 diff 后再合并。
-const VERSION = "1.8.0";
+const VERSION = "1.8.1";
 
 // 本地状态目录(默认参数持久化也放这里)
 const STATE_DIR = process.env.LOCALAPPDATA || HOST_DIR;

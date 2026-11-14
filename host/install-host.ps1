@@ -9,6 +9,11 @@ $ErrorActionPreference = "Stop"
 
 $HostName = "com.webtoopenapi.host"
 $Manifest = Join-Path $PSScriptRoot "com.webtoopenapi.host.json"
+# v1.8.1: 本机运行时 manifest 写到 LOCALAPPDATA(含本机绝对路径), 不动仓库里的占位符源文件。
+# 源文件可保持 C:\path\to\... 占位符干净入库, native messaging 读的是这份本地副本。
+$LocalDir = Join-Path $env:LOCALAPPDATA "webtoopenapi"
+if (-not (Test-Path $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+$LocalManifest = Join-Path $LocalDir "com.webtoopenapi.host.json"
 
 if (-not (Test-Path $Manifest)) { Write-Error "manifest not found: $Manifest"; exit 1 }
 
@@ -48,17 +53,17 @@ $json = $m | ConvertTo-Json -Depth 10
 # [System.Text.Encoding]::UTF8 is UTF8Encoding(true) in Windows PowerShell: it prepends a
 # UTF-8 BOM on EVERY write. RFC 8259 forbids a BOM in JSON and strict parsers reject such
 # files, so re-running this script would reintroduce the BOM. Write without it instead.
-[System.IO.File]::WriteAllText($Manifest, $json, (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText($LocalManifest, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 # Hard check: the manifest must not start with EF BB BF.
-$head = [System.IO.File]::ReadAllBytes($Manifest)
+$head = [System.IO.File]::ReadAllBytes($LocalManifest)
 if ($head.Length -ge 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF) {
     Write-Error "[verify] FAILED - manifest was written with a UTF-8 BOM"
     exit 1
 }
 
 if (-not (Test-Path $m.path)) { Write-Error "host launcher not found: $($m.path)"; exit 1 }
-Write-Host "[info] manifest:" $Manifest
+Write-Host "[info] manifest:" $LocalManifest
 Write-Host "[info] host path:" $m.path
 Write-Host "[info] allowed_origins:" ($m.allowed_origins -join ", ")
 
@@ -82,16 +87,16 @@ if ($Uninstall) {
 
 foreach ($k in $keys) {
     $sub = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($k.Substring("HKEY_CURRENT_USER\".Length))
-    $sub.SetValue("", $Manifest, [Microsoft.Win32.RegistryValueKind]::String)
+    $sub.SetValue("", $LocalManifest, [Microsoft.Win32.RegistryValueKind]::String)
     $sub.Close()
-    Write-Host "[registered]" $k "->" $Manifest
+    Write-Host "[registered]" $k "->" $LocalManifest
 }
 
 # read back to verify
 $verify = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Microsoft\Edge\NativeMessagingHosts\$HostName")
 $val = $verify.GetValue("")
 $verify.Close()
-if ($val -eq $Manifest) { Write-Host "[verify] OK - Edge key reads back correctly (Chrome key was written too)" }
+if ($val -eq $LocalManifest) { Write-Host "[verify] OK - Edge key reads back correctly (Chrome key was written too)" }
 else { Write-Error "[verify] FAILED - registry readback mismatch: $val"; exit 1 }
 
 Write-Host ""

@@ -7,6 +7,14 @@
 
 ---
 
+## [1.8.1] - 2026-11-14
+
+### Fixed
+
+- ⚠ **修复「本地服务未运行」回归**：`install-host.ps1` 此前就地改写仓库里的 `host/com.webtoopenapi.host.json` 的 `path` 字段。v1.8.0 提交时把 path 恢复为占位符 `C:\path\to\...` 后，本机 native messaging 注册表仍指向这个文件，扩展启动 host 读到无效路径 → host 起不来、popup 报「本地服务未运行」。
+  - 修法：`install-host.ps1` 改为把改写后的 manifest 写到 `%LOCALAPPDATA%\webtoopenapi\com.webtoopenapi.host.json`（独立副本，含本机绝对路径），注册表指向这份副本；仓库里的源文件永远保持占位符，不再被 install 污染。
+  - 重新运行 install 后验证：`/health` 返回 `status: ok`、`extension_connected: true`。
+
 ## [1.8.0] - 2026-11-14
 
 **可信动作层（阶段 A+B+C 一次落地）**：把「透传一个工具」升级为「执行一次受控动作」——派发前门禁、真输入通道、派发后取证、结构化回执。为后续自动填表单打底，未改动任何既有站点模块。

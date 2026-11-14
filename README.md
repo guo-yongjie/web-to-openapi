@@ -56,7 +56,7 @@ openapi-host.js ── lib/(基础设施) ── sites/(一个网页一个文件
    powershell -ExecutionPolicy Bypass -File host\install-host.ps1
    ```
    - 卸载：双击 `host\uninstall.bat`（或上面的 ps1 加 `-Uninstall`）。
-   - 脚本会把 `run_host.bat` 的真实绝对路径写回 manifest，并**根据扩展 key 自动推导扩展 ID**写入 `allowed_origins`——包解压在任何目录都能用。
+   - 脚本会把 `run_host.bat` 的真实绝对路径写进一份**本机副本**（`%LOCALAPPDATA%\webtoopenapi\com.webtoopenapi.host.json`），并**根据扩展 key 自动推导扩展 ID**写入 `allowed_origins`——仓库里的源 manifest 保持占位符不入库，包解压在任何目录都能用。
    - **Edge 和 Chrome 两个键会一起写上**（`HKCU\Software\Microsoft\Edge\NativeMessagingHosts` 与 `HKCU\Software\Google\Chrome\NativeMessagingHosts`），所以第 2 步选哪个浏览器都行，**不必为换浏览器重跑**。
 2. **加载扩展**（在你想用的浏览器里做一次即可）：
    - **Edge**：打开 `edge://extensions` → 开启「开发人员模式」→「加载已解包的扩展」→ 选择 `extension/`
