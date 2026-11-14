@@ -1,5 +1,16 @@
 # Web To OpenAPI —— 把任意网页能力封装成 OpenAPI / MCP 的浏览器插件 + 本地服务
 
+> ## ⭐ 增强分支（Fork of [dengzhh/web-to-openapi](https://github.com/dengzhh/web-to-openapi)）
+>
+> 本仓库在原作者基础上，新增了**可信动作层（Trusted Action Layer）+ 真实输入（CDP real input）**：
+>
+> - **8 个可信动作**：`observe` / `find` / `click` / `type` / `scroll` / `drag` / `select` / `run`，全部带回执（ActionReceipt），可验证「这一步到底做没做成」；
+> - **真实输入**：点击、键入、滚动、拖拽均走 CDP（`Input.dispatchMouseEvent` 等），产生 `isTrusted=true` 的事件，而非内容脚本合成事件，能通过目标页面的可信度校验；
+> - **语义定位 + 门禁**：`observe → find`（按 label/placeholder/name/id）拿 ref，再用 ref 操作，拒绝「凭记忆编元素」的幻觉；`run` 支持多步编排（fail-fast / continueOnError）；
+> - **真机验收过**：在真实页面逐项验证了 trusted 输入与回执，配套 mock 测试 80+ 例。
+>
+> 动作层入口：REST `POST /api/v1/act/*`；MCP 工具 `browser_observe/find/click/type/scroll/drag/select/run`。详见 `docs/写操作契约.md`。
+
 > **支持 Edge 与 Chrome（及其它 Chromium 内核浏览器）**。文中出现「Edge」的地方均可替换为 Chrome，二者用法完全一致——安装包里只有一份扩展，两个浏览器都能加载。
 
 把浏览器里的任意网页能力（需要登录的控制台、搜索引擎结果页、动态渲染的页面……），包装成**本地 HTTP 服务**对外提供：一套代码，**同时**暴露 OpenAPI（REST）与 MCP 两套接口。
