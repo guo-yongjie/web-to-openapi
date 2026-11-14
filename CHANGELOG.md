@@ -7,6 +7,15 @@
 
 ---
 
+## [1.10.1] - 2026-11-14
+
+**合入上游 run_host.bat（launcher 重构 + 修双开自杀 bug）**：从上游 `dbf9737`/`c21380d`/`d2223b0` 取 `host/run_host.bat` 最终版。
+
+- node 发现改为 PATH 解析（`%%~$PATH:I` + `where.exe` 双兜底）+ `node-path.txt` pin + `WEBTOOPENAPI_NODE` 环境变量。
+- 去掉 `2>> host-stderr.log` 重定向：双开 host（两个浏览器/残留进程）时 cmd 因日志文件被占用而放弃执行 node，导致第二个 host 起不来的自杀 bug。本地 `lib/log.js`（v1.6.0）已自写 `openapi-host.log`，去掉 `2>>` 无日志丢失。
+
+---
+
 ## [1.10.0] - 2026-11-14
 
 **动作层补齐 select + run 多步编排**：动作层从 6 个动作扩展到 8 个，为「自动填表单」打通最后两块。

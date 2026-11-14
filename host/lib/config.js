@@ -87,7 +87,7 @@ const CONFIG = loadConfig();
 const SERVICE = "web-to-openapi";
 // 本地加固版本号(v1.10.0: 动作层 select 下拉选择 + run 多步编排)。
 // 上游发版时请核对 diff 后再合并。
-const VERSION = "1.10.0";
+const VERSION = "1.10.1";
 
 // 本地状态目录(默认参数持久化也放这里)
 const STATE_DIR = process.env.LOCALAPPDATA || HOST_DIR;
