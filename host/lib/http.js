@@ -14,8 +14,9 @@ const registry = require("./registry");
 const mcp = require("./mcp");
 const { openApiSpec } = require("./spec");
 const { docsHtml } = require("./docs");
+const stats = require("./stats");
 const { toolCatalog } = require("./tools");
-const { withBrowserLock, callTool } = require("./util");
+const { withBrowserSlot, withBrowserLock, slotLimitOf, callTool } = require("./util");
 
 let httpServer = null;
 let httpPort = null;
@@ -23,14 +24,60 @@ let lastHost = null;
 let lastPort = null;
 let bindRetryTimer = null;
 
-function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj, null, 2);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
+// ---------------------------------------------------------------------------
+// 跨域与鉴权(2026-10-19 加固, 见 CHANGELOG v1.0.1)
+// 原实现对所有响应写死 Access-Control-Allow-Origin: * 且无任何凭据校验, 等价于
+// 把"浏览器全部登录态"做成对任意网页开放的接口。这里改为:
+//   1) Origin 白名单: 只放行扩展自身 + localhost/+ 显式配置的 allowed_origins
+//   2) 无 Origin 头的请求(本机 CLI / MCP 客户端)不适用跨域语义, 放行
+//   3) 可选 Bearer token: config.json 里配了 token 才强制(默认关, 不破坏现有脚本)
+// ---------------------------------------------------------------------------
+const EXT_ORIGIN_RE = /^chrome-extension:\/\/[a-p]{32}$/i;
+
+function normalizeOrigin(origin) {
+  return String(origin || "").trim().replace(/\/+$/, "");
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // 非浏览器调用
+  const clean = normalizeOrigin(origin);
+  const extra = CONFIG.allowed_origins || [];
+  if (extra.indexOf(clean) >= 0) return true;
+  if (EXT_ORIGIN_RE.test(clean)) return true; // 网页无法伪造 chrome-extension:// 这个 scheme
+  return mcp.isLocalOrigin(clean); // 本机页面(/docs 自查、本机工具页)
+}
+
+function corsHeaders(echoOrigin) {
+  const h = {
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  });
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    Vary: "Origin",
+  };
+  // 关键: 只回显命中的 Origin, 绝不回 "*"; 未命中则不设该头(浏览器拿不到响应体)
+  if (echoOrigin) h["Access-Control-Allow-Origin"] = echoOrigin;
+  return h;
+}
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a == null ? "" : a));
+  const y = Buffer.from(String(b == null ? "" : b));
+  if (!x.length || x.length !== y.length) return false;
+  try { return crypto.timingSafeEqual(x, y); } catch (e) { return false; }
+}
+
+function tokenOk(req, url) {
+  if (!CONFIG.token) return true;
+  const m = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  const provided = m ? m[1].trim() : String(url.searchParams.get("token") || "");
+  return safeEqual(provided, CONFIG.token);
+}
+
+function sendJson(res, status, obj, echoOrigin) {
+  const body = JSON.stringify(obj, null, 2);
+  res.writeHead(status, Object.assign({
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  }, corsHeaders(echoOrigin)));
   res.end(body);
 }
 
@@ -58,7 +105,10 @@ function endpointHandler(ep) {
     const input = ctx.method === "POST" ? ctx.body : ctx.searchParams;
     const args = ep.parse ? ep.parse(input) : input;
     const run = () => ep.run(args);
-    return ep.browser ? await withBrowserLock(run) : await run();
+    // v1.5.0: 按站点分槽(默认 1 槽 = 与旧版全局串行等价; ysbang 声明 3 槽)
+    return ep.browser
+      ? await withBrowserSlot((ep.site && ep.site.id) || "__browser__", slotLimitOf(ep), run)
+      : await run();
   };
 }
 
@@ -84,22 +134,42 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = decodeURIComponent(url.pathname);
   const method = req.method || "GET";
+
+  // 1) 跨域准入: 未命中的 Origin 直接拒绝, 且不回 ACAO(浏览器读不到响应体)
+  const reqOrigin = req.headers.origin;
+  const echoOrigin = isAllowedOrigin(reqOrigin) ? (reqOrigin ? normalizeOrigin(reqOrigin) : null) : null;
+  if (reqOrigin && !echoOrigin) {
+    log("warn", `blocked cross-origin request: ${reqOrigin} -> ${pathname}`);
+    return sendJson(res, 403, {
+      error: "forbidden origin",
+      origin: normalizeOrigin(reqOrigin),
+      hint: "该服务仅接受浏览器扩展自身与本机(localhost/127.0.0.1)页面的请求。确需放行其他来源时, 在 host/config.json 的 allowed_origins 中显式添加该 Origin。",
+    }, null);
+  }
+
   const done = (status, obj) => {
-    sendJson(res, status, obj);
+    sendJson(res, status, obj, echoOrigin);
+    stats.record(`${method} ${pathname}`, status, Date.now() - t0);
     log("http", `${method} ${pathname} -> ${status} (${Date.now() - t0}ms)`);
   };
   try {
+    // 2) 可选 token: 配了 token 才生效; /health /stats 与 /docs 保持公开(探活与观测)
+    const publicPath = pathname === "/" || pathname === "/health" || pathname === "/stats" || pathname === "/docs" || pathname === "/docs.html";
+    if (!publicPath && !tokenOk(req, url)) {
+      log("warn", `unauthorized request (token required): ${method} ${pathname}`);
+      return done(401, {
+        error: "unauthorized",
+        hint: "本实例已启用 token 鉴权: 请在请求头加 Authorization: Bearer <token>, 或加查询参数 ?token=<token>。token 见 host/config.json。",
+      });
+    }
+
     if (!routes.length) buildRoutes(); // 惰性兜底: 入口漏调 buildRoutes 时不至于静默 404
     if (method === "OPTIONS") {
-      res.writeHead(204, {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-      });
+      res.writeHead(204, corsHeaders(echoOrigin));
       return res.end();
     }
     if (method === "GET" && (pathname === "/" || pathname === "/docs" || pathname === "/docs.html")) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Access-Control-Allow-Origin": "*" });
+      res.writeHead(200, Object.assign({ "Content-Type": "text/html; charset=utf-8" }, corsHeaders(echoOrigin)));
       return res.end(docsHtml());
     }
     if (method === "GET" && pathname === "/openapi.json") return done(200, openApiSpec());
@@ -135,24 +205,24 @@ async function handleRequest(req, res) {
       }
       if (method === "GET") {
         // 规范中 GET 用于建立 SSE 流(可选能力); 本服务不提供流, 明确告知用 POST
-        res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*", Allow: "POST" });
+        res.writeHead(405, Object.assign({ "Content-Type": "application/json; charset=utf-8", Allow: "POST" }, corsHeaders(echoOrigin)));
         return res.end(JSON.stringify({ error: "SSE stream not offered", hint: "MCP Streamable HTTP: 用 POST 发送 JSON-RPC 消息到 /mcp" }));
       }
       if (method !== "POST") {
-        res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*", Allow: "POST" });
+        res.writeHead(405, Object.assign({ "Content-Type": "application/json; charset=utf-8", Allow: "POST" }, corsHeaders(echoOrigin)));
         return res.end(JSON.stringify({ error: "method not allowed", allow: "POST" }));
       }
       const msg = await readBody(req);
       // session: 无状态实现(每次请求自带全部上下文), 仍按规范回一个 id 头方便客户端对齐
       const sessionId = crypto.randomUUID();
       const rpcOut = async (status, obj) => {
+        stats.record("POST /mcp", status, Date.now() - t0);
         const bodyStr = JSON.stringify(obj, null, 2);
-        res.writeHead(status, {
+        res.writeHead(status, Object.assign({
           "Content-Type": "application/json; charset=utf-8",
-          "Access-Control-Allow-Origin": origin && mcp.isLocalOrigin(origin) ? origin : "*",
           "Access-Control-Expose-Headers": "Mcp-Session-Id",
           "Mcp-Session-Id": sessionId,
-        });
+        }, corsHeaders(echoOrigin)));
         res.end(bodyStr);
         log("http", `MCP ${(obj && obj.result && obj.result.serverInfo) ? "initialize" : (msg && msg.method) || "?"} -> ${status}`);
       };
@@ -210,7 +280,6 @@ function startHttp() {
         socket.end(
           "HTTP/1.1 400 Bad Request\r\n" +
           "Content-Type: application/json; charset=utf-8\r\n" +
-          "Access-Control-Allow-Origin: *\r\n" +
           `Content-Length: ${Buffer.byteLength(payload)}\r\n` +
           "Connection: close\r\n\r\n" +
           payload

@@ -20,6 +20,19 @@ const DEFAULT_CONFIG = {
   //   "window"       一律独立窗口但不激活(focused:false)
   //   "window-front" 独立窗口并激活: 旧行为, 每次调用都弹窗抢焦点
   page_mode: "auto",
+  // v1.5.0: 浏览器并发槽上限。0 = 按站点声明(ysbang 3, 其余 1, 与旧版行为一致);
+  // >0 = 对所有站点强制封顶(设 1 即恢复「全局串行」的旧语义)。风控收紧时用它。
+  browser_concurrency: 0,
+  // ---------------------------------------------------------------------------
+  // 安全策略(2026-10-19 加固, 见 CHANGELOG v1.0.1)
+  // allowed_origins: 额外的跨域白名单。默认空数组 —— 只放行 chrome-extension://(扩展自身)与
+  //                  localhost/127.0.0.1(本机页面), 其他浏览器 Origin 一律 403。
+  //                  需要给某个内网页面开权限时显式加, 例: ["http://192.168.1.10:3000"]
+  // token:           非空时, 除 /health 与 /docs 外的所有请求都必须带
+  //                  Authorization: Bearer <token> 或 ?token=<token>。
+  //                  默认空 = 不启用(兼容现有脚本); 与他人共用机器时建议开启。
+  allowed_origins: [],
+  token: "",
 };
 
 function loadConfig() {
@@ -37,6 +50,17 @@ function loadConfig() {
     if (fileCfg.port) cfg.port = parseInt(fileCfg.port, 10);
     if (fileCfg.tool_timeout_ms) cfg.tool_timeout_ms = parseInt(fileCfg.tool_timeout_ms, 10);
     if (fileCfg.page_mode) cfg.page_mode = String(fileCfg.page_mode).trim().toLowerCase();
+    if (fileCfg.browser_concurrency !== undefined) cfg.browser_concurrency = parseInt(fileCfg.browser_concurrency, 10) || 0;
+    // allowed_origins: 允许数组, 或逗号/空格分隔的字符串; 统一成去空格、去尾斜杠的数组
+    if (fileCfg.allowed_origins !== undefined) {
+      const raw = Array.isArray(fileCfg.allowed_origins)
+        ? fileCfg.allowed_origins
+        : String(fileCfg.allowed_origins).split(/[,\s]+/);
+      cfg.allowed_origins = raw
+        .map((s) => String(s || "").trim().replace(/\/+$/, ""))
+        .filter(Boolean);
+    }
+    if (typeof fileCfg.token === "string") cfg.token = fileCfg.token.trim();
   } catch (e) {
     cfg.warnings.push(`config.json 读取失败(${e.message}), 使用默认/环境变量配置`);
   }
@@ -44,6 +68,7 @@ function loadConfig() {
   if (process.env.WEBTOOPENAPI_PORT) cfg.port = parseInt(process.env.WEBTOOPENAPI_PORT, 10);
   if (process.env.WEBTOOPENAPI_TOOL_TIMEOUT_MS) cfg.tool_timeout_ms = parseInt(process.env.WEBTOOPENAPI_TOOL_TIMEOUT_MS, 10);
   if (process.env.WEBTOOPENAPI_PAGE_MODE) cfg.page_mode = process.env.WEBTOOPENAPI_PAGE_MODE.trim().toLowerCase();
+  if (process.env.WEBTOOPENAPI_BROWSER_CONCURRENCY) cfg.browser_concurrency = parseInt(process.env.WEBTOOPENAPI_BROWSER_CONCURRENCY, 10) || 0;
   if (!PAGE_MODES.includes(cfg.page_mode)) {
     cfg.warnings.push(`page_mode "${cfg.page_mode}" 不合法(可选 ${PAGE_MODES.join(" / ")}), 已回退为 auto`);
     cfg.page_mode = "auto";
@@ -54,7 +79,9 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 const SERVICE = "web-to-openapi";
-const VERSION = "1.0.0";
+// 本地加固版本号(v1.6.0: 日志轮转 + /stats 观测 + 药师帮缓存/熔断落盘持久化)。
+// 上游发版时请核对 diff 后再合并。
+const VERSION = "1.6.0";
 
 // 本地状态目录(默认参数持久化也放这里)
 const STATE_DIR = process.env.LOCALAPPDATA || HOST_DIR;
