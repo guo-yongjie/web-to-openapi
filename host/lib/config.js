@@ -39,10 +39,11 @@ function loadConfig() {
   const cfg = { ...DEFAULT_CONFIG, warnings: [] };
   let configPath = path.join(HOST_DIR, "config.json");
   const args = process.argv.slice(2);
+  const cli = {}; // v1.7.1 修复: 命令行此前被 config.json 覆盖, 与注释声明的优先级相反
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--config" && args[i + 1]) configPath = args[i + 1];
-    if (args[i] === "--host" && args[i + 1]) cfg.host = args[i + 1];
-    if (args[i] === "--port" && args[i + 1]) cfg.port = parseInt(args[i + 1], 10);
+    if (args[i] === "--host" && args[i + 1]) cli.host = args[i + 1];
+    if (args[i] === "--port" && args[i + 1]) cli.port = parseInt(args[i + 1], 10);
   }
   try {
     const fileCfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
@@ -66,9 +67,14 @@ function loadConfig() {
   }
   if (process.env.WEBTOOPENAPI_HOST) cfg.host = process.env.WEBTOOPENAPI_HOST;
   if (process.env.WEBTOOPENAPI_PORT) cfg.port = parseInt(process.env.WEBTOOPENAPI_PORT, 10);
+  // 命令行的优先级高于 config.json(与文件头注释一致): 放在文件之后、环境变量之前应用
+  if (cli.host) cfg.host = cli.host;
+  if (Number.isFinite(cli.port)) cfg.port = cli.port;
   if (process.env.WEBTOOPENAPI_TOOL_TIMEOUT_MS) cfg.tool_timeout_ms = parseInt(process.env.WEBTOOPENAPI_TOOL_TIMEOUT_MS, 10);
   if (process.env.WEBTOOPENAPI_PAGE_MODE) cfg.page_mode = process.env.WEBTOOPENAPI_PAGE_MODE.trim().toLowerCase();
   if (process.env.WEBTOOPENAPI_BROWSER_CONCURRENCY) cfg.browser_concurrency = parseInt(process.env.WEBTOOPENAPI_BROWSER_CONCURRENCY, 10) || 0;
+  // v1.7.1: token 支持环境变量覆盖 —— 便于不把密钥写进任何文件(CI / 多机同步 / 临时收紧)
+  if (process.env.WEBTOOPENAPI_TOKEN) cfg.token = process.env.WEBTOOPENAPI_TOKEN.trim();
   if (!PAGE_MODES.includes(cfg.page_mode)) {
     cfg.warnings.push(`page_mode "${cfg.page_mode}" 不合法(可选 ${PAGE_MODES.join(" / ")}), 已回退为 auto`);
     cfg.page_mode = "auto";
@@ -79,9 +85,9 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 const SERVICE = "web-to-openapi";
-// 本地加固版本号(v1.6.0: 日志轮转 + /stats 观测 + 药师帮缓存/熔断落盘持久化)。
+// 本地加固版本号(v1.8.0: 可信动作层 act/observe+click+type, 带回执与门禁)。
 // 上游发版时请核对 diff 后再合并。
-const VERSION = "1.6.0";
+const VERSION = "1.8.0";
 
 // 本地状态目录(默认参数持久化也放这里)
 const STATE_DIR = process.env.LOCALAPPDATA || HOST_DIR;

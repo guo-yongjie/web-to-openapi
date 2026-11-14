@@ -15,10 +15,13 @@ const registry = require("../lib/registry");
 
 const sites = [
   require("./_service"), // 服务自身: /health + service_health + browser_tool
+  require("./actions"), // 可信动作层: act/observe + act/click + act/type(带回执)
   require("./scnet"),
   require("./baidu"),
   require("./google"),
   require("./translate"), // 在线翻译: 统一入口 + 引擎表(加引擎只改 translate.js 里的 ENGINES)
+  require("./ysbang"), // 药师帮批发报价: 自动翻页 + 字体连字解码(解码脚本在 ysbang-decode.js)
+  require("./qshtyy"), // 海豚药药(兰州强生): 站内 JSON 接口直连 + 批量 + 跨平台比价
 ];
 
 for (const s of sites) registry.register(s);

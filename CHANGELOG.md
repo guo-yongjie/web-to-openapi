@@ -7,6 +7,167 @@
 
 ---
 
+## [1.8.0] - 2026-11-14
+
+**可信动作层（阶段 A+B+C 一次落地）**：把「透传一个工具」升级为「执行一次受控动作」——派发前门禁、真输入通道、派发后取证、结构化回执。为后续自动填表单打底，未改动任何既有站点模块。
+
+### 新增（阶段 A：host 侧可信层）
+- `host/lib/probe.js`：页面注入探针。ref 为 `<pageToken>.r<N>`，pageToken 每份文档首次注入时生成 → 刷新即变，旧 ref 报 `DOCUMENT_CHANGED` 而不是含糊的「找不到元素」。内置 MutationObserver 计数、URL 哈希、值与勾选态快照（只回长度与前 3 字符，不回明文）。
+- `host/lib/action.js`：编排层。`resolve`（token/存活/可见/未遮挡/未禁用 + 300ms 静默采样）→ `dispatch` → `settle`（100ms 轮询，上限 1.5s）→ `verdict`。
+- `host/sites/actions.js`：三个端点 + MCP 工具 `browser_observe` / `browser_click` / `browser_type`。
+  - `POST /api/v1/act/observe`、`POST /api/v1/act/click`、`POST /api/v1/act/type`
+- 三条硬规则：**超时不重试**（`dispatched:"unknown"` + `retryable:false`）、**不冒领**（仅 mutation 且派发前页面在动 → `unattributable`）、**known-set**（未 observe 的 ref 一律拒绝且不派发）。
+
+### 新增（阶段 B：真输入通道）
+- `extension/background.js`：`chrome_computer` 的 `left_click`/`right_click` 支持 `forceCdp: true` —— 直接用 `Input.dispatchMouseEvent` 发受信输入，跳过内容脚本合成事件与截图坐标缩放，回包带 `transport:"cdp"` 与 `trusted:true`。
+- ⚠ 修掉一个既有缺陷：坐标点击在 `clickTool` 失败后 fallback 时，会经 `project()` 用截图上下文缩放坐标，参数缺失时算出 NaN，CDP 报 `Failed to deserialize params.x` —— 即坐标点击原本不可用。forceCdp 路径完全绕开它。
+- `type` 动作原本就走 `Input.insertText`（真输入），本次只补了聚焦点击的真输入。
+
+### 新增（阶段 C：split press/release + withheld）
+- `forceCdp` 时支持 `splitPress: true`（host 默认开启）：press 后重新探测坐标处元素指纹，若已不是同一个元素，则把 release 送到视口外 `(-10,-10)` —— 既释放按键状态又不激活任何元素，回执标 `withheld:true` 并给出 `swapped:{before,after}`。`type` 的聚焦点击被扣发时立即停止键入，避免文字打到别处。
+
+### 真机验收中发现并修掉的三个 bug（都在上线前拦住）
+1. **⚠ REST 层把 `forceCdp` 折叠成 false**（`sites/actions.js` 的 `parseInput`）：`truthy(undefined)` 返回 false，
+   导致不传参数时 forceCdp 永远关着，点击落到 clickTool 合成路径 —— 那条路坐标缩放有 bug，会点到**别的标签页**的元素上。
+   现改为三态：不传 = 默认开启真输入，显式 `forceCdp=false` 才关闭。MCP 侧不受影响。
+2. **CDP 输入事件对后台标签不可靠**：`Runtime.evaluate` 能到后台标签，但 `Input.dispatchMouseEvent` 到了渲染器也不触发 handler（实测，透传与编排路径同样复现）。`action.js` 派发输入前先用 `chrome_switch_tab` 把标签激活到前台（等 180ms），激活失败不阻断、由 settle 如实回报。
+3. **`page_token` 强迫症**：ref 本身带 token 前缀（`<tok>.r<N>`），host 现在自动从 ref 推导，调用方不必再显式传 `page_token`（显式传时仍以它为准）；页面侧 token 校验与 known-set 校验保持不变，安全性无损。
+
+### 改动
+- 版本号 1.7.1 → 1.8.0（`host/lib/config.js`）。
+- `host/sites/index.js` 注册 `actions` 站点。
+- `docs/写操作契约.md`：契约一补上 `input_kind` / `reached_target` / `withheld` / `swapped` / `postcondition` / `retryable` 的实际取值与语义。
+- `docs/可信动作层方案_ActionReceipt.md`：状态改为已实施，记录「阶段 B 被提前到 A 之前」的原因。
+- 测试 51 → 67 例（新增 `host/test/action.test.js` 16 例，全 mock，不碰真浏览器）。
+
+### 兼容性
+- 既有端点行为不变；不传 `forceCdp` 的 `chrome_computer` 调用走原路径。
+- 新端点**未**加入 `http.js` 的 `publicPath`，v1.7.1 起的 token 鉴权对它们自动生效。
+
+---
+
+## [1.7.1] - 2026-11-14
+
+⚠ **安全：启用 token 鉴权**（此前 `token` 一直为空 = 不鉴权）。PATCH：不改任何端点行为，但**未带凭据的调用方会开始收到 401**，升级前必须同步调用方（见下）。
+
+### 为什么现在做
+
+`chrome_javascript` 能在登录态浏览器里执行任意 JS。token 为空 + 无 Origin 头的本机请求一律放行，等于**本机任何进程都能操控你的浏览器**。下一步要上「自动填表单」这类写操作，提交类动作出事不可逆，所以鉴权必须先于写操作落地。
+
+### 服务端
+
+- `host/config.json`：填入 36 位随机 token（`w2o_` + 24 字节 base64url）
+- 公开路径保持 `/`、`/health`、`/stats`、`/docs`（探活与观测不设门槛），其余含 `/mcp` 全部要求 `Authorization: Bearer` 或 `?token=`
+- `host/lib/config.js`：
+  - 新增 `WEBTOOPENAPI_TOKEN` 环境变量覆盖（密钥可不落文件）
+  - 修复 **`--host/--port` 被 config.json 覆盖**的 bug：注释声明「config.json < 命令行 < 环境变量」，代码实际是文件覆盖命令行。修复后优先级与注释一致
+- `host/config.json` **移出版本控制**（`git rm --cached`，本地文件保留）并加入 `.gitignore`；新增模板 `host/config.example.json`
+- `host/mcp-stdio.js`：转发 `/mcp` 时自动带凭据（env 优先，其次同目录 config.json）
+
+### 调用方同步
+
+| 调用方 | 改动 |
+|---|---|
+| WorkBuddy `~/.workbuddy/mcp.json` | `web-to-openapi` 增加 `type: streamablehttp` 与 `headers.Authorization` |
+| storehub | `config.openapiToken`（env `OPENAPI_TOKEN`）+ `collector.js` 请求头 `...AUTH_HEADERS` |
+| `tools/ysb-decoder/w2o.py` | token 取 env `WEBTOOPENAPI_TOKEN` 否则读宿主 `host/config.json`；`batch_enquiry.py` 复用其 `headers()` |
+
+> 未配置 token 的调用方保持旧行为（不带头），不会静默破坏——只是会被 401 拒掉，报错明确。
+
+### 测试
+
+51 例全绿（基线 50 + 新增 1）。新增用例锁死公开路径清单：`/health /docs /stats /` 免凭据，`/mcp /api/v1/* /openapi.json` 必须 401。另修 `security.test.js` 与本机配置的耦合（测试内强制 `CONFIG.token=""`，此前本机一填 token 就有一半用例假失败）。
+
+### 文档
+
+- 新增 `docs/写操作契约.md`：写操作的 4 条契约（统一回执 / 永不自动重试 / 目标只用 ref / 赋值方式由调用方声明）+ 新增工具检查清单
+- 新增 `docs/可信动作层方案_ActionReceipt.md`：ActionReceipt 实现方案（暂不实施，附触发条件）
+- README「隐私与安全」同步鉴权说明
+
+---
+
+## [1.7.0] - 2026-11-14
+
+新增采购比价站点「海豚药药极速版」（`pc.qshtyy.com`，兰州强生医药 B2B 平台）。MINOR：只加站点与新端点，不改任何既有端点行为。
+
+### 为什么这次很轻
+
+该站的搜索是**标准 JSON 接口、价格明文**：没有药师帮的字体连字反爬、没有 AES 密文、不用 DOM 抽取、不用翻页等待。药师帮模块 1411 行 + 两个辅助模块，这里是单文件。
+
+实测摸清的两段式接口（2026-11-14 现场抓包）：
+
+| 接口 | 作用 | 关键事实 |
+|---|---|---|
+| `POST /api/goods/search/onCondition` | 关键词 → 命中列表 | **只返回 `goodsId` + `goodsName`**，价格/库存都不在这里；`pageSize=500` 时服务端直接返回全部命中（92 条一次拿完），翻页不必用 |
+| `POST /api/goods/goodsInfo/list` | id 列表 → 明细 | `limitSize=200` 可一次回 200 条；返回 60 余个字段，含 `sellingPrice`/`retailPrice`/`marketPrice`/`quantity`/`expirationDate`/`minimum`/`packages`/`piece`/`licenseNumber`/`ybfl`/`cgbeizhu` |
+
+认证不是 Cookie 也不是 `Authorization`：**请求头 `token: <localStorage.token>`**。三种都实测过 —— 只带 Cookie 返回 `code:401 "登录已过期"`，带 `token` 头才是 `code:200`（顺带解释了为什么纯 curl 拿不到数据）。
+
+### Added
+
+- **`qshtyy_price`**（`GET|POST /api/v1/qshtyy/price`）—— 单品种报价。参数 `q` / `limit`(默认 100，上限 300) / `sort`(price_asc·price_desc·stock_desc，本地排序) / `in_stock` / `min_expiry` / `nocache`。返回 `price`(账号采购价)、`retail_price`、`market_price`、`stock`、`expiry`、`moq`、`pack`、`piece`、`approval`、`insurance`、`purchase_tag` 等。
+- **`qshtyy_batch_price`**（`GET|POST /api/v1/qshtyy/batch`）—— 批量询价，单次上限 10 个品种。**同一标签内顺序跑**（不是多标签并发：单品种只有 2 个请求，开标签的开销远大于请求本身），词间留 400~800ms；单品种失败不拖垮整批，登录失效立即 `aborted=true`。
+- **`price_compare`**（`GET|POST /api/v1/compare/price`）—— 跨平台并排比价：海豚药药 vs 药师帮并行跑，返回四层口径（见下）。
+- **`sites/qshtyy.js`** 新模块；`sites/index.js` 注册一行；`test/helpers/fake-browser.js` 增加 qshtyy 桩（按脚本里的 `/api/goods/search/onCondition` 字面量分派，可用 `qshtyyRows/qshtyyTotal/qshtyyExpired/qshtyyNoToken/qshtyyApiError` 控制返回）。
+
+### 三个实现决策（都是被实测数据逼出来的）
+
+1. **页面内先裁字段再回传** —— 60 条全字段原始 JSON 是 **121KB**（均条 2028 字节）。扩展对「单字符串」返回值有 10KB 截断，所以页面内映射成短键（`i/n/s/m/p/...`）并 `return` 对象而非 `JSON.stringify`，100 条约 20KB，host 侧再还原成可读字段名。
+2. **优先复用用户已开的本站标签** —— 新开一个标签要跑 20+ 个初始化请求（热词/广告/配置）。实测复用后单品种 <1.5s（冷启动约 12s），且只读 `localStorage` + 发 `fetch`，不改用户页面状态，所以**复用的标签不关**（响应带 `reused_tab`）。
+3. **缓存只做 5 分钟内存版** —— 该站请求压力远小于药师帮，但也没必要让「同一个词连问三次」重复打接口；5 分钟足以去重，又不至于给出过时价格。`nocache=1` 强制重采。
+
+### 口径与风险（写进响应里，避免误用）
+
+- `price` 是**当前登录账号可见的采购价**（`sellingPrice`），不是全网最低价，也不是零售价；`market_price` 实测常为 `0.00`，已做容错。
+- 该站是**单一供货方**（兰州强生）对同一品种的多厂家多规格报价，与药师帮的「多供应商」语义不同。
+- 宽词规模实测：`片` 2730 条、`胶囊` 1259 条、`口服液` 211 条。超 `limit` 的截断并在响应里标 `truncated: true`。
+- 站点接口 `code != 200` 时**显式报 502**（提示「接口可能已变更」）而不是返回 0 条 —— 空列表会被误读成「没有这个药」。
+- 登录态失效（`no_token` / `code:401`）走 `needs_human`：切前台、保留标签、提示重新登录。
+
+### ⚠ 比价为什么必须分四层（真机实测逼出来的，不是设计洁癖）
+
+第一次真机跑「化积口服液」，diff 给出 **便宜 1496%**。逐条查下去，三层假象叠在一起：
+
+| 层 | 药师帮最低价 | 真相 |
+|---|---|---|
+| 全场最低 | 0.50 元 | 店铺「药店品种预约中心」，**效期 2026-12-31（只剩一个多月）**，且品名是字体反爬残留的纯乱码 |
+| 同口径（排除临期/预约/乱码） | 5.03 元 | 川奇「**消食**化积口服液」—— 保健品公司的另一个品种，不是同一个药 |
+| 同品名（品名无多余修饰） | 5.40 元 | 恩威「好娃友 化积口服液」—— 但海豚药药那条 7.98 是**江西诚志永丰**的，不同厂家 |
+| **同厂家（同品种同规格）** | **6.90 元** | 江西诚志永丰 10ml*6支 —— 与海豚药药 7.98 唯一可比的数字，差 1.08 元（15.65%） |
+
+所以响应结构固定为：
+
+- `diff`：全场最低价对比，附 `plausibility{plausible,reason,hint}`（最低价条目带 flags 或价差 >200% 时 `plausible:false`）
+- `fair`：同口径 —— 两边排除效期 <6 个月；药师帮再排除预约/预售店铺、品名乱码，以及不含查询词的条目（`extra_words` 会标出多出的字，如「消食」）
+- `fair.ysbang.lowest_strict` + `diff_strict`：品名完全一致的那批
+- `fair.ysbang.same_manufacturer` + `diff_same_manufacturer`：同厂家（厂家名归一，括号/「有限公司」等后缀不影响判定），`manufacturer_mismatch` 直接告诉你前一层是否换了厂家
+
+### Fixed
+
+- **⚠ 测试把假数据写进生产缓存** —— v1.6.0 起药师帮缓存落盘，而 `fake-browser` 生成的条目（「第1页药品1 / 某某医药」）会被测试写进真实的 `%LOCALAPPDATA%\webtoopenapi\ysbang-cache.json`。真机 `price_compare` 因此命中假缓存，**返回了一整份假报价**（实测踩到，靠"第1页药品1"这种名字才发现）。
+  - 修法：`fake-browser` 在 **require `lib/nm` 之前** 把 `LOCALAPPDATA` 指向临时目录。为什么必须在这个位置 —— `nm → lib/config`，`STATE_DIR` 在 config **加载那一刻**就算好了，写在 `install()` 里已经晚了（第一版就是这么漏的）。
+  - 已在临时区的（`stats-persist.test.js` 自建临时目录）不覆盖，避免打断其固定路径断言。
+  - 影响面：所有用假浏览器的测试文件（`ysbank-parallel*` 等此前均无隔离）；本轮已清掉缓存里 5 条历史假条目，保留 3 条真实数据。
+
+### Changed
+
+- `host/lib/config.js` `VERSION` → 1.7.0；`extension/manifest.json` `version` **1.5.2 → 1.7.0**（此前跟着 1.6.0 漏改一版，这轮补齐）。
+- README：工具清单与 API 一览补三个新端点，`sites/` 目录说明补 `qshtyy.js`，新增「海豚药药」用法一节。
+
+### Tests
+
+- 新增 `host/test/qshtyy.test.js` **17 例**：短键映射与类型（价格必须是 number）、本地筛选排序、缓存命中不碰浏览器、登录失效 → 503 且不关标签、token 缺失、接口异常 → 502、宽词截断、零结果不报错、复用标签、批量单品种失败不中断、批量超 10 个 400、比价缺一方不给 diff、临期/预约/乱码识别、品名差异识别（消食化积 ≠ 化积）、厂家名归一、fair 三层结构、缺 q 400。
+- 全量 **50/50 通过**（基线 33 + 新增 17）。
+- 新增的 `freshInstall` 会清整个 `host/` 的 require 缓存：`lib/util` 在加载时就解构了 `nm.callTool`，只清 `sites/` 会让新装的假浏览器接不到调用。
+- 校验方式：跑完全量测试后检查 `ysbang-cache.json` 不含任何「第1页药品」假条目。
+
+### Notes
+
+- 新端点需 **host 重启**后才出现在 `/openapi.json` 与 MCP `tools/list`（重启浏览器或重载扩展即可拉起新 host）。
+- 本站点依赖内部接口，站点改版会失效；失效时按 502 提示核对两个接口路径即可，不影响其他站点。
+
+---
+
 ## [1.6.0] - 2026-11-14
 
 面向长期运行的运维三件套（MINOR：兼容增强，不改任何默认行为与接口契约）。

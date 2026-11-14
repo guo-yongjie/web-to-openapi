@@ -28,6 +28,8 @@
 "use strict";
 
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const readline = require("readline");
 
 // ---------------------------------------------------------------- 配置
@@ -38,6 +40,23 @@ function resolvePort() {
   return 8090;
 }
 const PORT = resolvePort();
+
+/*
+ * v1.7.1: 宿主启用 token 后, 本入口转发到 /mcp 也必须带凭据。
+ * 取法与 openapi-host 一致: 环境变量优先, 其次读同目录 config.json(与宿主共用一份)。
+ * 都取不到则不带头 —— 兼容未启用 token 的旧宿主, 不静默破坏。
+ */
+function resolveToken() {
+  if (process.env.WEBTOOPENAPI_TOKEN) return process.env.WEBTOOPENAPI_TOKEN.trim();
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, "config.json"), "utf8");
+    return String(JSON.parse(raw).token || "").trim();
+  } catch (e) {
+    return "";
+  }
+}
+const TOKEN = resolveToken();
+const AUTH_HEADERS = TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
 const HOST = process.env.WEBTOOPENAPI_MCP_HOST || "127.0.0.1";
 
 function errLog(msg) {
@@ -59,6 +78,7 @@ function forward(line) {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(payload),
           Accept: "application/json",
+          ...AUTH_HEADERS,
         },
         timeout: 150000, // 搜索类工具真实驱动浏览器, 可能 5-15s; 留足余量
       },

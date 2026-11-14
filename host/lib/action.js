@@ -1,0 +1,439 @@
+"use strict";
+/*
+ * 可信动作层(v1.8.0, 阶段 A)
+ * ---------------------------------------------------------------------------
+ * 把「透传一个工具」升级成「执行一次受控动作」: 派发前门禁 → 派发 → 取证 → 结构化回执。
+ *
+ *   resolve  校验 token / 元素存活 / 可见 / 未遮挡, 采基线 + 静默度
+ *   guard    stale 非空即拒绝, 绝不带着疑问去点击
+ *   dispatch 经 chrome_computer 派发(阶段 A 为扩展默认通道, 阶段 B 起可 forceCdp)
+ *   settle   轮询强信号/弱信号, 上限可配
+ *   verdict  changed / unattributable / none —— 弱证据且页面本来在动时不冒领
+ *
+ * 三条硬规则(承自重读 nanobrowser 后的结论, 见 docs/可信动作层方案_ActionReceipt.md):
+ *   1) 超时不重试: callTool 超时 -> dispatched:"unknown", retryable:false
+ *   2) 不冒领: 只有 mutation 这种弱证据时, 页面原本在动就判 unattributable
+ *   3) known-set: 没 observe 过的 ref 一律 REF_NOT_PRESENTED, 不猜、不兜底
+ *
+ * 与站点模块的关系: 本层不碰任何具体站点逻辑, 只认 tabId + ref。
+ */
+const util = require("./util");
+const { log } = require("./log");
+const probe = require("./probe");
+
+// 通过 util 间接调用, 便于测试时整体替换(单测不碰真浏览器)
+const callTool = (name, args, timeoutMs) => util.callTool(name, args, timeoutMs);
+const dataText = util.dataText;
+const sleep = util.sleep;
+
+const INPUT_KIND = "synthetic"; // 阶段 B 落地 forceCdp 后改 trusted
+const OBSERVE_MAX = 120;
+const SETTLE_MS = 1500;
+const QUIET_MS = 300;
+
+// ---------------------------------------------------------------- 页面执行
+/*
+ * 在页面主世界执行探针脚本, 同时拿回真实 tabId(未显式传 tabId 时由扩展选活动标签)。
+ * 不走 util.js 的 jsEval: 那里只回 result 内层, 这里需要外层 tabId。
+ */
+async function evalInPage(tabId, code, timeoutMs) {
+  const args = { code, timeoutMs: timeoutMs || 20000, maxOutputBytes: 262144 };
+  if (tabId != null) args.tabId = tabId;
+  const data = await callTool("chrome_javascript", args);
+  const text = dataText(data);
+  let outer;
+  try {
+    outer = JSON.parse(text);
+  } catch (e) {
+    throw new Error("页面脚本响应不是合法 JSON(可能被扩展 sanitize 截断): " + String(text).slice(0, 160));
+  }
+  if (outer && outer.success === false) {
+    const err = (outer.error && (outer.error.message || outer.error.kind)) || "unknown";
+    throw new Error("页面脚本执行失败: " + String(err).slice(0, 200));
+  }
+  let inner = outer && outer.result !== undefined ? outer.result : outer;
+  if (typeof inner === "string") {
+    try { inner = JSON.parse(inner); }
+    catch (e) { throw new Error("页面脚本返回的不是 JSON: " + inner.slice(0, 160)); }
+  }
+  return { tabId: (outer && outer.tabId) || tabId, out: inner || {} };
+}
+
+// ---------------------------------------------------------------- 回执组装
+function receipt(parts) {
+  const r = {
+    ok: !parts.stale,
+    input_kind: parts.input_kind || INPUT_KIND,
+    target: parts.target || null,
+    dispatched: parts.dispatched === undefined ? false : parts.dispatched,
+    // 是否确认输入真的到达目标: 阶段 A/C 之前无法证明, 一律 null 而不是假装 true
+    reached_target: parts.reached_target === undefined ? null : parts.reached_target,
+    mechanism: parts.mechanism || null,
+    effect: parts.effect || { verdict: "none", signals: [], elapsed_ms: 0 },
+    postcondition: parts.postcondition || { met: true, checks: [] },
+    stale: parts.stale || null,
+    retryable: parts.retryable === undefined ? false : parts.retryable,
+  };
+  if (parts.stale_reason) r.stale_reason = parts.stale_reason;
+  if (parts.hit) r.hit = parts.hit;
+  if (parts.withheld !== undefined) r.withheld = parts.withheld;
+  if (parts.swapped) r.swapped = parts.swapped;
+  if (parts.note) r.note = parts.note;
+  return r;
+}
+
+function effectFromSettle(s) {
+  const signals = [];
+  if (s.signal) signals.push(s.signal);
+  if (s.after && s.after.path) signals.push("path:" + s.after.path);
+  return { verdict: "none", signals, elapsed_ms: s.elapsed_ms || 0 };
+}
+
+/*
+ * 弱证据的归属判定: 只有 mutation 增长时, 看派发前那段窗口页面自己是否在动。
+ * quiet > 0 说明点击前页面就在自己刷 DOM, 这次增长不能算在动作头上 -> unattributable。
+ */
+function verdictOf(settleOut, quiet) {
+  if (settleOut.verdict === "changed") return "changed";
+  if (settleOut.verdict === "weak") return quiet > 0 ? "unattributable" : "changed";
+  return "none";
+}
+
+function postconditionOf(settleOut, expect) {
+  const checks = (settleOut && settleOut.checks) || [];
+  const met = expect && expect.length ? checks.every((c) => c.ok) : true;
+  return { met, checks };
+}
+
+// ---------------------------------------------------------------- observe
+async function observe(opts) {
+  const o = opts || {};
+  const code = probe.observeScript(o.max == null ? OBSERVE_MAX : o.max);
+  const { tabId, out } = await evalInPage(o.tabId, code, o.timeout_ms);
+  log("action", `observe tab=${tabId} tok=${out.tok} scanned=${out.scanned} shown=${out.shown}`);
+  return {
+    ok: true,
+    tab_id: tabId,
+    page_token: out.tok,
+    url_path: out.state && out.state.path,
+    title: out.state && out.state.title,
+    scanned: out.scanned,
+    shown: out.shown,
+    truncated: !!out.truncated,
+    elements: out.elements || [],
+    hint: "把 ref 原样传给 act/click 或 act/type; 页面一旦重新加载, 旧 ref 会以 DOCUMENT_CHANGED 失效, 重新 observe 即可。",
+  };
+}
+
+// ---------------------------------------------------------------- 目标解析
+/*
+ * page_token 自动推导: ref 格式是 "<tok>.r<N>", 前缀就是 token。
+ * 调用方不传 page_token 时从 ref 推导 —— 页面侧仍会校验 curTok===WANT(挡跨文档混乱)
+ * 和 refs 注册表(挡幻觉 ref), 安全性无损, 只是省掉一个多余参数。
+ * 显式传 page_token 且与 ref 前缀不一致时以显式值为准(页面对比会拒绝)。
+ */
+function wantTokOf(ref, explicit) {
+  if (explicit) return explicit;
+  const m = /^([A-Za-z0-9]+)\.r\d+$/.exec(String(ref || ""));
+  return m ? m[1] : "";
+}
+
+async function resolveTarget(tabId, ref, wantTok, quietMs) {
+  const code = probe.resolveScript(ref, wantTok, quietMs == null ? QUIET_MS : quietMs);
+  const { tabId: realTab, out } = await evalInPage(tabId, code, 25000);
+  return { tabId: realTab, res: out };
+}
+
+// ---------------------------------------------------------------- 派发
+function isTimeoutError(e) {
+  return /timed out|timeout/i.test(String((e && e.message) || e));
+}
+
+/*
+ * CDP 输入事件(Input.dispatchMouseEvent / insertText)对**后台标签不可靠**:
+ * Runtime.evaluate 能到, 鼠标事件到了渲染器却不触发 handler(实测)。
+ * 所以派发输入前先把标签激活到前台 —— 真人操作也总是发生在前台标签上。
+ * 激活失败不阻断(输入照发, 只是可能无效, 由 settle 的 verdict 如实反映)。
+ */
+async function activateTab(tabId) {
+  if (tabId == null) return;
+  try {
+    await callTool("chrome_switch_tab", { tabId }, 15000);
+    await sleep(180); // 等渲染器完成切换与绘制
+  } catch (e) {
+    log("warn", `activate tab ${tabId} failed (继续派发): ${e.message}`);
+  }
+}
+
+/*
+ * 派发点击。默认走 forceCdp(扩展 v1.8.0 起支持): 直接用 Input.dispatchMouseEvent 发受信输入,
+ * 绕开内容脚本合成事件与截图坐标缩放。旧扩展不认这个参数时会退回原通道 —— 此时扩展回包里
+ * 没有 trusted 字段, 回执就如实标 synthetic, 不假装是真输入。
+ */
+async function dispatchClick(tabId, target, opts) {
+  const o = opts || {};
+  const args = {
+    tabId,
+    action: "left_click",
+    coordinates: { x: target.cx, y: target.cy },
+  };
+  if (o.forceCdp !== false) args.forceCdp = true;
+  // 阶段 C: press 后重新确认目标仍是同一个元素, 变了就把 release 送到视口外(不激活任何元素)
+  if (o.splitPress !== false) args.splitPress = true;
+  if (o.modifiers) args.modifiers = o.modifiers;
+  await activateTab(tabId);
+  try {
+    const data = await callTool("chrome_computer", args, o.timeout_ms || 30000);
+    const text = dataText(data);
+    const parsed = safeParse(text);
+    if (parsed && parsed.success === false) {
+      return { dispatched: false, error: String(parsed.error || "click failed").slice(0, 200) };
+    }
+    return {
+      dispatched: true,
+      trusted: !!(parsed && parsed.trusted === true),
+      transport: (parsed && parsed.transport) || null,
+      withheld: !!(parsed && parsed.withheld === true),
+      target_before: (parsed && parsed.target_before) || null,
+      target_after: (parsed && parsed.target_after) || null,
+      raw: parsed,
+    };
+  } catch (e) {
+    // 超时 != 失败: 扩展可能已经点下去了, 只是回包慢
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
+async function dispatchType(tabId, text, opts) {
+  const o = opts || {};
+  const args = { tabId, action: "type", text: String(text) };
+  if (o.forceCdp) args.forceCdp = true;
+  try {
+    const data = await callTool("chrome_computer", args, o.timeout_ms || 30000);
+    const parsed = safeParse(dataText(data));
+    if (parsed && parsed.success === false) {
+      return { dispatched: false, error: String(parsed.error || "type failed").slice(0, 200) };
+    }
+    return { dispatched: true, raw: parsed };
+  } catch (e) {
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
+async function dispatchKey(tabId, keys, opts) {
+  const o = opts || {};
+  try {
+    await callTool("chrome_computer", { tabId, action: "key", text: String(keys) }, o.timeout_ms || 20000);
+    return { dispatched: true };
+  } catch (e) {
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
+function safeParse(s) {
+  try { return JSON.parse(s); } catch (e) { return null; }
+}
+
+// ---------------------------------------------------------------- settle
+async function settle(tabId, ref, res, expect, maxMs) {
+  const base = Object.assign({}, res.before || {}, { base: res.base || null });
+  const code = probe.settleScript(ref, base, expect || [], maxMs == null ? SETTLE_MS : maxMs);
+  try {
+    const r = await evalInPage(tabId, code, (maxMs || SETTLE_MS) + 15000);
+    return r.out;
+  } catch (e) {
+    // 取证失败不能把动作判成失败: 派发已经发生, 这里只降级证据
+    log("warn", `settle failed (${e.message}); 降级为 unknown 证据`);
+    return { verdict: "none", signal: null, elapsed_ms: 0, error: e.message, checks: [] };
+  }
+}
+
+// ---------------------------------------------------------------- click
+async function click(opts) {
+  const o = opts || {};
+  if (!o.ref) {
+    const e = new Error("act/click 需要 ref(先调 act/observe 取)");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+  const r0 = await resolveTarget(o.tabId, o.ref, wantTokOf(o.ref, o.page_token), o.quiet_ms);
+  const res = r0.res;
+  const tabId = r0.tabId;
+
+  if (res.stale) {
+    log("action", `click rejected: ${res.stale} ref=${o.ref}`);
+    return receipt({
+      stale: res.stale,
+      stale_reason: res.why,
+      target: o.ref ? { ref: o.ref } : null,
+      dispatched: false,
+      hit: res.hit,
+      retryable: res.stale === "REF_NOT_PRESENTED" || res.stale === "NOT_VISIBLE" || res.stale === "OBSCURED",
+      note: "派发前门禁拒绝, 浏览器未收到任何输入。",
+    });
+  }
+
+  const target = res.target;
+  const d = await dispatchClick(tabId, target, o);
+  if (d.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: d.dispatched,
+      mechanism: "pointer",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d.dispatched === false,
+      note: d.dispatched === "unknown"
+        ? "派发结果未知(超时): 点击可能已经生效, 重复调用有双发风险, 因此不重试。请先 observe 看页面当前状态再决定。"
+        : "派发失败: " + (d.error || "unknown"),
+    });
+  }
+
+  // 阶段 C: press 之后目标被换掉 —— release 已扣发(送到视口外), 本次点击没有激活任何元素
+  if (d.withheld) {
+    log("action", `click withheld: 目标在 press 后变更为 ${d.target_after} (原 ${d.target_before})`);
+    return receipt({
+      target,
+      input_kind: d.trusted ? "trusted" : "synthetic",
+      dispatched: true,
+      mechanism: "pointer",
+      hit: target.hit,
+      withheld: true,
+      swapped: { before: d.target_before, after: d.target_after },
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: true,
+      note: "按下之后目标元素已变(页面在按下瞬间改动了布局或弹出浮层), 已扣发 release 并送到视口外, 因此本次点击没有激活任何元素。建议重新 observe 后再试。",
+    });
+  }
+
+  const s = await settle(tabId, o.ref, res, o.expect, o.settle_ms);
+  const verdict = verdictOf(s, res.quiet);
+  return receipt({
+    target,
+    input_kind: d.trusted ? "trusted" : "synthetic",
+    dispatched: true,
+    mechanism: "pointer",
+    hit: target.hit,
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, o.expect),
+    retryable: verdict === "none",
+    note: verdict === "unattributable"
+      ? "只看到 DOM 变动, 但派发前页面自身就在变动, 无法归因于本次点击。"
+      : undefined,
+  });
+}
+
+// ---------------------------------------------------------------- type
+/*
+ * 输入流程: 先真点击聚焦(坐标), 再 insertText。
+ * 不把 ref 透给 chrome_computer —— 那边认的是扩展自己的 ref_N, 跟本层的 ref 不是一套。
+ */
+async function type(o) {
+  const opts = o || {};
+  if (!opts.ref) {
+    const e = new Error("act/type 需要 ref(先调 act/observe 取)");
+    e.status = 400;
+    throw e;
+  }
+  if (opts.text == null) {
+    const e = new Error("act/type 需要 text");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+  const r0 = await resolveTarget(opts.tabId, opts.ref, wantTokOf(opts.ref, opts.page_token), opts.quiet_ms);
+  const res = r0.res;
+  const tabId = r0.tabId;
+
+  if (res.stale) {
+    log("action", `type rejected: ${res.stale} ref=${opts.ref}`);
+    return receipt({
+      stale: res.stale,
+      stale_reason: res.why,
+      target: { ref: opts.ref },
+      dispatched: false,
+      hit: res.hit,
+      retryable: res.stale === "REF_NOT_PRESENTED" || res.stale === "NOT_VISIBLE",
+      note: "派发前门禁拒绝, 浏览器未收到任何输入。",
+    });
+  }
+
+  const target = res.target;
+  const mode = opts.mode === "replace" ? "replace" : "append";
+
+  // 聚焦: 用坐标点击, 与 click 同一条通道
+  const focusRes = await dispatchClick(tabId, target, opts);
+  if (focusRes.dispatched === "unknown") {
+    return receipt({
+      target,
+      dispatched: "unknown",
+      mechanism: "keyboard",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: false,
+      note: "聚焦点击超时, 结果未知; 为避免双发与错位输入, 已停止后续键入。",
+    });
+  }
+  if (focusRes.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: false,
+      mechanism: "keyboard",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: true,
+      note: "聚焦点击失败: " + (focusRes.error || "unknown"),
+    });
+  }
+  // 聚焦点击被扣发 = 焦点没落到目标上, 此时键入会打进别的元素, 必须停下
+  if (focusRes.withheld) {
+    return receipt({
+      target,
+      input_kind: focusRes.trusted ? "trusted" : "synthetic",
+      dispatched: true,
+      mechanism: "keyboard",
+      hit: target.hit,
+      withheld: true,
+      swapped: { before: focusRes.target_before, after: focusRes.target_after },
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: true,
+      note: "聚焦点击被扣发(按下后目标变了), 焦点未落到目标元素, 为避免文字打到别处已停止键入。",
+    });
+  }
+
+  if (mode === "replace") {
+    await dispatchKey(tabId, "ctrl+a", opts);
+    await sleep(60);
+  }
+
+  const d = await dispatchType(tabId, opts.text, opts);
+  if (d.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: d.dispatched,
+      mechanism: "keyboard",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d.dispatched === false,
+      note: d.dispatched === "unknown"
+        ? "键入结果未知(超时): 文本可能已写入, 重复调用会叠加内容, 因此不重试。"
+        : "键入失败: " + (d.error || "unknown"),
+    });
+  }
+
+  const s = await settle(tabId, opts.ref, res, opts.expect, opts.settle_ms);
+  const verdict = verdictOf(s, res.quiet);
+  return receipt({
+    target,
+    input_kind: focusRes.trusted ? "trusted" : "synthetic",
+    dispatched: true,
+    mechanism: "keyboard",
+    hit: target.hit,
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, opts.expect),
+    retryable: verdict === "none",
+    note: mode === "replace" ? "已先 ctrl+a 全选再键入(替换模式)。" : undefined,
+  });
+}
+
+module.exports = { observe, click, type, INPUT_KIND };

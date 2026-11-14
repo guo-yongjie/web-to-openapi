@@ -3013,7 +3013,17 @@ var __yieldStar = (value) => {
             return best.tab;
           };
           const explicitTab = yield this.tryGetTab(tabId);
-          const existingTab = explicitTab || pickBestMatch(url, candidateTabs);
+          /*
+           * ⚠ 本地补丁(web-to-openapi v1.5.1, 上游发版需核对后再合并):
+           * pickBestMatch 只比 pathname + search, 对 hash 路由站点(如
+           * https://dian.ysbang.cn/#/indexContent?searchkey=x&page=2)来说所有页面的
+           * pathname 都是 "/"、search 都是空, 于是被判成「同一 URL」直接复用已有标签,
+           * 连 chrome.tabs.update 都不做 —— 调用方拿到旧标签、URL 根本没变。
+           * 实测后果: 并发开 3 个标签拿到了同一个 tabId, 页码永远是 1。
+           * 调用方明确要新窗口(newWindow/width/height)时, 语义上就不该复用, 直接跳过匹配。
+           */
+          const wantsOwnWindow = newWindow === true || typeof width === "number" || typeof height === "number";
+          const existingTab = explicitTab || (wantsOwnWindow ? null : pickBestMatch(url, candidateTabs));
           if ((existingTab == null ? void 0 : existingTab.id) !== void 0) {
             console.log(
               `URL already open in Tab ID: ${existingTab.id}, Window ID: ${existingTab.windowId}`
@@ -33579,6 +33589,86 @@ ${sanitizedStack}` : message2
                 ((_h2 = params.modifiers) == null ? void 0 : _h2.shiftKey) ? "shift" : void 0
               ].filter((v) => typeof v === "string")
             );
+            // ---- v1.8.0 forceCdp: 跳过内容脚本合成事件与截图坐标缩放, 直接发受信 CDP 输入
+            // 动机: (1) 合成 click 是 isTrusted:false, React 受控组件/部分站点不认;
+            //       (2) clickTool 失败后 fallback 会经 project() 缩放坐标, 有截图上下文时算错。
+            // 约定: coordinates 必须已是 viewport CSS 像素(调用方用 getBoundingClientRect 算出)。
+            if (params.forceCdp && params.coordinates) {
+              const fx = Number(params.coordinates.x);
+              const fy = Number(params.coordinates.y);
+              if (!Number.isFinite(fx) || !Number.isFinite(fy)) {
+                return createErrorResponse("forceCdp requires finite coordinates.x / coordinates.y");
+              }
+              const fbutton = params.action === "right_click" ? "right" : "left";
+              // 坐标处的元素指纹: press 会引起页面 handler, 目标可能换行/被浮层盖住
+              const probeAt = (x, y) => __async(null, null, function* () {
+                try {
+                  const r = yield CDPHelper.send(tab.id, "Runtime.evaluate", {
+                    expression: "(function(){var e=document.elementFromPoint(" + x + "," + y + ");" +
+                      "if(!e)return 'none';var p=[],n=e;for(var i=0;i<3&&n;i++){p.push(n.tagName+(n.id?'#'+n.id:''));n=n.parentElement;}" +
+                      "return p.join('<');})()",
+                    returnByValue: true
+                  });
+                  return (r && r.result) ? r.result.value : null;
+                } catch (e) { return null; }
+              });
+              try {
+                yield CDPHelper.attach(tab.id);
+                try {
+                  const before = yield probeAt(fx, fy);
+                  yield CDPHelper.dispatchMouseEvent(tab.id, {
+                    type: "mouseMoved",
+                    x: fx, y: fy, button: "none", buttons: 0, modifiers: modifiersMask
+                  });
+                  yield CDPHelper.dispatchMouseEvent(tab.id, {
+                    type: "mousePressed",
+                    x: fx, y: fy, button: fbutton,
+                    buttons: fbutton === "left" ? 1 : 2,
+                    clickCount: 1, modifiers: modifiersMask
+                  });
+                  // v1.8.0 stage C: split press/release —— release 才是激活点。
+                  // press 可能触发 hover/展开/换行, 若此刻目标已不是同一个元素,
+                  // 就把 release 送到视口外(既释放按键状态, 又不激活任何元素) = withheld。
+                  let withheld = false;
+                  let after = null;
+                  if (params.splitPress) {
+                    yield new Promise(function (r) { setTimeout(r, 50); });
+                    after = yield probeAt(fx, fy);
+                    withheld = !!(before && after && before !== after);
+                  }
+                  yield CDPHelper.dispatchMouseEvent(tab.id, {
+                    type: "mouseReleased",
+                    x: withheld ? -10 : fx,
+                    y: withheld ? -10 : fy,
+                    button: fbutton,
+                    buttons: 0, clickCount: 1, modifiers: modifiersMask
+                  });
+                  return {
+                    content: [{
+                      type: "text",
+                      text: JSON.stringify({
+                        success: true,
+                        action: params.action,
+                        coordinates: { x: fx, y: fy },
+                        transport: "cdp",
+                        trusted: true,
+                        withheld: withheld,
+                        target_before: before || null,
+                        target_after: after
+                      })
+                    }],
+                    isError: false
+                  };
+                } finally {
+                  yield CDPHelper.detach(tab.id);
+                }
+              } catch (e) {
+                try { yield CDPHelper.detach(tab.id); } catch (e2) { /* ignore */ }
+                return createErrorResponse(
+                  "forceCdp click failed: " + (e instanceof Error ? e.message : String(e))
+                );
+              }
+            }
             if (params.ref) {
               const domResult2 = yield clickTool.execute({
                 ref: params.ref,

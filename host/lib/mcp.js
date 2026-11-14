@@ -10,7 +10,7 @@
  */
 const { SERVICE, VERSION } = require("./config");
 const registry = require("./registry");
-const { withBrowserLock } = require("./util");
+const { withBrowserSlot, slotLimitOf } = require("./util");
 const { log } = require("./log");
 
 const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -56,8 +56,8 @@ async function toolCall(name, args) {
   const t = registry.findTool(name);
   if (!t) throw new Error("unknown tool: " + name + " (tools/list 查看可用工具)");
   const run = () => t.run(args || {});
-  // 需要驱动浏览器的工具串行化(同时开两个窗口会互相抢焦点)
-  return t.browser ? await withBrowserLock(run) : await run();
+  // v1.5.0: 按站点分槽(站点 concurrency 声明, 默认 1 槽)
+  return t.browser ? await withBrowserSlot(t.site && t.site.id, slotLimitOf(t), run) : await run();
 }
 
 // 处理单条 JSON-RPC 消息; 返回 null 表示 notification(不应答)

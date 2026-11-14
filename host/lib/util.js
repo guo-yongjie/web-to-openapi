@@ -9,13 +9,73 @@ const { CONFIG } = require("./config");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// 串行化浏览器操作(同时开两个窗口会互相抢焦点)。
-// 端点/工具声明 browser:true 时, 由 http.js 与 mcp.js 统一包这把锁。
-let opChain = Promise.resolve();
+/*
+ * 浏览器操作准入控制(v1.5.0 起由「全局串行」升级为「按站点分槽」)
+ * ---------------------------------------------------------------------------
+ * v1.5.0 之前: 所有 browser:true 的端点共用一把全局锁, 任何两次调用都必须排队。
+ *   理由是同站点多标签会互抢翻页状态, 两个窗口会抢焦点。
+ * v1.5.0 起: 改为按站点 id 的信号量。站点可用 concurrency 声明自己最多开几个
+ *   并行槽(ysbang: 3), 其余站点默认 1 —— 默认行为与过去完全一致。
+ *   全局开关 CONFIG.browser_concurrency: 0=按站点声明; >0 时对所有站点强制封顶
+ *   (调试或风控收紧时用, 设 1 即回到旧的全局串行语义)。
+ *
+ * 注意: 槽位解决的是「不同调用之间」的排队; 同一次调用内部的多个标签由站点
+ * 自己的 worker 池管理(ysbang.js 的 tabs 参数), 不要指望这里替站点做页级调度。
+ */
+const slots = new Map(); // key -> { limit, active, queue }
+
+function withBrowserSlot(key, limit, fn) {
+  const k = key || "__browser__";
+  const lim = Math.max(1, Math.floor(Number(limit) || 1));
+  let s = slots.get(k);
+  if (!s) { s = { limit: lim, active: 0, queue: [] }; slots.set(k, s); }
+  s.limit = lim;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      if (s.active >= s.limit) { s.queue.push(attempt); return; }
+      s.active++;
+      Promise.resolve().then(fn).then(resolve, reject).finally(() => {
+        s.active--;
+        const next = s.queue.shift();
+        if (next) next();
+      });
+    };
+    attempt();
+  });
+}
+
+// 兼容旧调用点: 全局单槽 = 原来的 withBrowserLock
 function withBrowserLock(fn) {
-  const run = opChain.then(fn);
-  opChain = run.catch(() => {});
-  return run;
+  return withBrowserSlot("__global__", 1, fn);
+}
+
+// 站点/端点声明的槽位上限(端点 > 站点 > 1; 再受 CONFIG.browser_concurrency 封顶)
+function slotLimitOf(owner) {
+  const declared = (owner && (owner.concurrency || (owner.site && owner.site.concurrency))) || 1;
+  const cap = CONFIG.browser_concurrency || 0;
+  const lim = cap > 0 ? Math.min(cap, declared) : declared;
+  return Math.max(1, Math.floor(lim));
+}
+
+/*
+ * 跨标签的请求节流闸。
+ * 多标签并发的风险不在标签数, 而在「请求间隔被压缩」——风控拦的是规律与突发。
+ * 所以并发路径共用同一把闸: 每个真正触发列表请求的动作先 wait(), 闸按
+ * [minMs,maxMs] 随机间隔发号, 使 N 个标签的总请求节奏仍接近单人翻页。
+ * mark(): 只登记一次已发生的请求(串行路径用), 让并发 worker 不会紧贴着它发车。
+ */
+function createPacer(minMs, maxMs) {
+  let nextAt = 0;
+  const gap = () => minMs + Math.floor(Math.random() * Math.max(1, (maxMs || minMs) - minMs));
+  return {
+    mark() { nextAt = Math.max(nextAt, Date.now() + gap()); },
+    async wait() {
+      const now = Date.now();
+      const at = Math.max(now, nextAt);
+      nextAt = at + gap();
+      if (at > now) await sleep(at - now);
+    },
+  };
 }
 
 function dataText(data) {
@@ -194,6 +254,14 @@ async function extractSerp(tabId, code, opts) {
   const flag = o.flag || "hasRso";
   const label = o.label || "serp";
   let lastCount = -1;
+  // settleMs > 0: 条目数必须「连续 settleMs 毫秒不变」才算稳定。
+  // 默认只用「两次读数相等」, 这在后台/被遮挡的窗口里会早退 —— Chromium 会节流
+  // 不可见窗口的渲染, 渲染可能停 1 秒以上, 于是 14 条被当成完整结果(实测并发页踩过)。
+  const settleMs = o.settleMs || 0;
+  // expect > 0: 明确的「够数」目标(如整页 60 条)。达到即返回, 不等静置 ——
+  // 这是识别「渲染中途停住」最可靠的信号: 药师帮会先画十几张, 卡几秒再补满。
+  const expect = o.expect || 0;
+  let stableSince = 0;
   let d = null;
   for (let i = 0; i < tries; i++) {
     d = await jsEval(tabId, code, { maxOutputBytes: 262144 });
@@ -209,7 +277,14 @@ async function extractSerp(tabId, code, opts) {
     // 稳定性还要求"条目够多或已 complete": SERP 渐进渲染, 只按"两次读数相等"会在
     // 第 1 条出现时就早退(实测谷歌只返回 1 条)。
     const stable = n > 0 && n === lastCount && (d.ready === "complete" || n >= 5);
-    if (loaded && stable) return d;
+    if (loaded && expect > 0 && n >= expect) return d; // 够一页 = 完整, 立即返回
+    if (loaded && stable) {
+      if (!settleMs) return d;
+      if (!stableSince) stableSince = Date.now();
+      if (Date.now() - stableSince >= settleMs) return d;
+    } else {
+      stableSince = 0; // 数字还在变 = 重新计时
+    }
     if (!loaded && i === tries - 1) {
       log("warn", `${label} page not fully loaded after ${tries}s: ${JSON.stringify({ ready: d && d.ready, [flag]: d && d[flag], bodyLen: d && d.bodyLen })}`);
     }
@@ -288,5 +363,6 @@ function truthy(v) { return /^(1|true|yes)$/i.test(String(v || "")); }
 module.exports = {
   sleep, dataText, num, strList, openPage, closeTab, closePage, focusTab, needsHuman,
   jsEval, decodeUrlCodes, extractSerp, followRedirect, resolveLinks, toSearchParams,
-  paramList, truthy, UA, withBrowserLock, callTool, PAGE_MODES,
+  paramList, truthy, UA, withBrowserLock, withBrowserSlot, slotLimitOf, createPacer,
+  callTool, PAGE_MODES,
 };

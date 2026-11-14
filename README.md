@@ -37,7 +37,7 @@ openapi-host.js ── lib/(基础设施) ── sites/(一个网页一个文件
 | `extension/` | 独立浏览器扩展（**Edge / Chrome 通用**；从 `chrome-mcp-server-1.0.0` 复制改造：新密钥/新 ID、宿主名改为 `com.webtoopenapi.host`、品牌重命名为 Web To OpenAPI、内置 Options 设置页） |
 | `host/openapi-host.js` | **启动入口（薄）**：装配站点注册表 → native messaging → HTTP 服务 |
 | `host/lib/` | 基础设施：`config` 配置 / `log` 日志 / `nm` native messaging 命令通道 / `util` 浏览器操作（开页·执行 JS·重试提取·链接还原）/ `defaults` 默认参数三层合并 / `registry` 站点注册表 / `mcp` MCP 协议 / `spec` `/openapi.json` / `docs` `/docs` 文档页 / `tools` 浏览器工具目录 / `http` 路由分发 |
-| `host/sites/` | **一个网页一个文件**：`scnet.js` / `baidu.js` / `google.js` / `translate.js`（在线翻译，内部用引擎表聚合多站点）+ 服务自身的 `_service.js`。新增能力只在这里加文件，见「新增一个网页」 |
+| `host/sites/` | **一个网页一个文件**：`scnet.js` / `baidu.js` / `google.js` / `translate.js`（在线翻译，内部用引擎表聚合多站点）/ `ysbang.js`（药师帮，字体反爬 + 页面挂钩）/ `qshtyy.js`（海豚药药，站内 JSON 接口直连 + 批量 + 跨平台比价）+ 服务自身的 `_service.js`。新增能力只在这里加文件，见「新增一个网页」 |
 | `host/mcp-stdio.js` | MCP stdio 桥接入口（独立进程，零依赖）：把 MCP 客户端的按行 JSON-RPC 转发到 `/mcp`，供 Claude Desktop 类客户端以 command 方式接入 |
 | `host/config.json` | **默认**监听地址/端口（`host` / `port` / `tool_timeout_ms`）——仅当「插件设置」未配置时生效 |
 | `host/run_host.bat` | 浏览器拉起 host 的启动器（自动找 node.exe；Edge / Chrome 走同一个） |
@@ -192,8 +192,14 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | `google_search_defaults` | `GET /api/v1/search/google/defaults` | 谷歌三层默认参数 |
 | `translate_text` | `GET\|POST /api/v1/translate` | 在线翻译，`engine` 切换引擎（当前百度） |
 | `translate_engines` | `GET /api/v1/translate/engines` | 可用翻译引擎 + 54 种语言代码（含中文名与别名） |
+| `qshtyy_price` | `GET\|POST /api/v1/qshtyy/price` | 海豚药药（兰州强生）报价，接口直连（约 1-2s） |
+| `qshtyy_batch_price` | `GET\|POST /api/v1/qshtyy/batch` | 海豚药药批量询价（单次最多 10 个品种） |
+| `price_compare` | `GET\|POST /api/v1/compare/price` | 海豚药药 vs 药师帮并排比价 |
 | `service_health` | `GET /health` | 服务健康状态（监听/扩展连通/运行时长） |
 | `browser_tool` | `POST /api/v1/tools/{name}` | 透传任意 chrome_* 浏览器工具 |
+| `browser_observe` | `POST /api/v1/act/observe` | 可信动作层：观察可交互元素，分配 ref + page_token（点击/输入前置） |
+| `browser_click` | `POST /api/v1/act/click` | 可信动作层：点击 ref 并返回 ActionReceipt（派发门禁 + 收敛取证） |
+| `browser_type` | `POST /api/v1/act/type` | 可信动作层：聚焦 ref 键入文本并返回 ActionReceipt（回执不回明文） |
 
 列表参数（site/intitle/inurl/intext/exclude/or）传数组（`["a.com","b.com"]`）或逗号分隔字符串均可；默认参数三层合并逻辑与 REST 完全一致（请求 > 设置页默认 > 内置）。
 
@@ -218,8 +224,14 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | GET | `/api/v1/translate` | **在线翻译**：`q` + `from`/`to` + `engine`（统一入口，当前支持百度），约 3-6s。`from`/`to` 可选 54 种语言代码，见下文清单 |
 | POST | `/api/v1/translate` | 同上，JSON body 传参——**中文文本推荐用这个** |
 | GET | `/api/v1/translate/engines` | 可用翻译引擎 + 54 种语言代码（`languages[].code/label/aliases`） |
+| GET\|POST | `/api/v1/qshtyy/price` | **海豚药药（兰州强生）报价**：走站内 JSON 接口，价格明文无混淆，约 1-2s（见下文） |
+| GET\|POST | `/api/v1/qshtyy/batch` | 海豚药药批量询价：一个标签跑多个品种，单次最多 10 个 |
+| GET\|POST | `/api/v1/compare/price` | 跨平台并排比价：海豚药药 vs 药师帮并行跑，附差价与宽松同规格匹配 |
 | GET | `/api/v1/tools` | 可用浏览器操作工具目录 |
 | POST | `/api/v1/tools/{name}` | 透传调用任意浏览器工具（搜索、抓取等新能力的统一入口） |
+| POST | `/api/v1/act/observe` | **可信动作层**：观察页面可交互元素，分配 ref 与 page_token（点击/输入的前置步骤） |
+| POST | `/api/v1/act/click` | **可信动作层**：点击 ref，返回 ActionReceipt（派发前门禁 + 收敛取证 + 结构化回执） |
+| POST | `/api/v1/act/type` | **可信动作层**：聚焦 ref 并键入文本，返回 ActionReceipt（回执只含长度与前 3 字符，不回明文） |
 
 > 示例接口 `scnet/free-credit`、`scnet/token-plan`、`search/baidu`、`search/google` 只是「用浏览器能力封装一个 Web API」的样板。新增任何 Web 能力（如页面正文提取、表单自动化）都走同一套机制，成熟后会作为预置端点陆续加入。
 
@@ -361,6 +373,59 @@ curl -s http://127.0.0.1:8090/api/v1/translate/engines
 
 **加一个引擎**：在 `host/sites/translate.js` 的 `ENGINES` 里加一项（`buildUrl` + `translate`），路由 / MCP 工具 / `openapi.json` / 文档页全部自动沿用。需要「注入文本 + 点按钮」的引擎，用 `chrome_fill_or_select` / `chrome_click_element` 组合即可，结构不用改。
 
+### 海豚药药（兰州强生）：站内接口直连 + 批量 + 跨平台比价
+
+`pc.qshtyy.com`（海豚药药极速版，兰州强生医药 B2B 平台）的搜索是**标准 JSON 接口、价格明文**，没有字体连字反爬、不用 DOM 抽取、不用翻页等待，所以这里是单文件、两个 POST 就拿到全字段。
+
+| 工具 | 对应 REST | 说明 |
+|---|---|---|
+| `qshtyy_price` | `GET\|POST /api/v1/qshtyy/price` | 单品种报价，约 1-2 秒 |
+| `qshtyy_batch_price` | `GET\|POST /api/v1/qshtyy/batch` | 批量询价，单次最多 10 个品种 |
+| `price_compare` | `GET\|POST /api/v1/compare/price` | 海豚药药 vs 药师帮并排比价 |
+
+```bash
+# 单品种（中文建议用 POST，免 URL 编码）
+curl -s -X POST http://127.0.0.1:8090/api/v1/qshtyy/price \
+  -H "Content-Type: application/json" \
+  -d '{"q":"化积口服液","limit":100,"in_stock":true}'
+
+# 批量 + 只要效期在 2028-06 之后的
+curl -s -X POST http://127.0.0.1:8090/api/v1/qshtyy/batch \
+  -H "Content-Type: application/json" \
+  -d '{"qs":["化积口服液","藿香正气颗粒"],"min_expiry":"2028-06"}'
+
+# 跨平台比价（include_ysbang=false 可只查海豚药药，秒回）
+curl -s -X POST http://127.0.0.1:8090/api/v1/compare/price \
+  -H "Content-Type: application/json" \
+  -d '{"q":"化积口服液","include_ysbang":true,"ysbang_pages":3}'
+```
+
+**接口事实**（2026-11-14 抓包，改版时按这张表核对）：
+
+| 项 | 事实 |
+|---|---|
+| 认证 | 请求头 `token: <localStorage.token>`——**不是 Cookie、不是 Authorization**（只带 Cookie 返回 `code:401 登录已过期`） |
+| 搜索 | `POST /api/goods/search/onCondition`，body `{channelType:0, columnType:0, pageNumber:1, pageSize:N, newCategoryLabelId:-1, manufacturer:[], specification:[], keyWords:"词", searchType:0}`；**只回 goodsId + 品名** |
+| 明细 | `POST /api/goods/goodsInfo/list`，body `{goodsIdList:[...], limitSize:N, limitStart:0}`；`limitSize=200` 实测可一次回 200 条 |
+| 字段 | `sellingPrice`(你的采购价) / `retailPrice` / `marketPrice`(常为 0.00) / `quantity` / `expirationDate` / `minimum`(起订) / `packages`(中包装) / `piece`(件装) / `licenseNumber` / `ybfl`(医保) / `cgbeizhu`(采购标签) |
+| 规模 | `片` 2730 条、`胶囊` 1259 条、`口服液` 211 条——宽词用 `limit` 截断并标 `truncated` |
+
+**使用要点**：
+
+- 复用浏览器里已登录的账号。若已开着本站标签则直接复用（0 额外请求、**不会关掉你的标签**，响应带 `reused_tab`）；登录失效会把页面切到前台让你重新登录，并返回 `503 needs_human=true`。
+- `price` 是**你账号可见的采购价**，不是全网最低价；该站是**单一供货方**对同一品种的多厂家多规格报价，与药师帮「多供应商」语义不同。
+- 结果按 **5 分钟内存缓存**复用（同词同参数），`nocache=1` 强制重采。
+- `price_compare` 返回四层口径，**优先看 `diff_same_manufacturer`**：同一厂家同一规格才有可比性。以「化积口服液」实测为例：全场最低 0.50 元（临期+预约锁货+品名乱码，`plausible:false`）→ 同口径 5.03（其实是「**消食**化积口服液」，另一品种）→ 同品名 5.40（恩威，但海豚那条 7.98 是江西诚志永丰）→ **同厂家 6.90（差 1.08 元 / 15.65%）**。直接拿全场最低比会得出「便宜 15 倍」的荒谬结论。
+
+  | 字段 | 含义 |
+  |---|---|
+  | `diff` | 全场最低价对比，附 `plausibility{plausible,reason,hint}`；最低价条目带 flags 或价差 >200% 时 `plausible:false` |
+  | `fair` | 同口径：两边排除效期 <6 个月的临期货；药师帮再排除预约/预售店铺、品名乱码、不含查询词的条目（`extra_words` 标出多出的字，如「消食」） |
+  | `fair.ysbang.lowest_strict` / `diff_strict` | 品名完全一致的那批里的最低价 |
+  | `fair.ysbang.same_manufacturer` / `diff_same_manufacturer` | 同厂家最低价（厂家名已归一）；`manufacturer_mismatch` 提示上一层是否换了厂家 |
+  | `same_spec_matches` | 按品名里规格片段（`10ml`/`12支`）的宽松匹配，仅供核对 |
+- 站点接口 `code != 200` 时直接 **502**（提示「接口可能已变更」），不会静默返回 0 条——空列表会被误读成「没有这个药」。
+
 ### 在插件设置页配置默认查询参数
 
 扩展设置页（`edge://extensions` 或 `chrome://extensions` → 本扩展「详细信息」→「扩展选项」）提供「百度搜索默认参数」与「Google 搜索默认参数」两张卡片：
@@ -408,7 +473,10 @@ node tools/gen-key.mjs --apply   # 生成密钥 + 写回 manifest key 与 allowe
 
 - **只在本机**：默认监听 `127.0.0.1`，不对外暴露；不收集、不上传任何数据，也没有任何遥测。
 - **无凭据存储**：服务不保存账号密码，也不持有任何 API Key —— 它复用的就是你在浏览器（Edge / Chrome）里已有的登录态（浏览器自动化 + 你自己的会话）。
-- **接口无鉴权**：任何能访问 `127.0.0.1:8090` 的本机进程都能调用接口，等价于「能操控你的浏览器」。**不要把它绑定到 `0.0.0.0` 或暴露到公网/局域网**。
+- **接口鉴权（v1.7.1 起默认开启）**：`host/config.json` 的 `token` 非空时，除 `/`、`/health`、`/stats`、`/docs` 外的所有端点（含 `/mcp`）都必须带 `Authorization: Bearer <token>` 或 `?token=<token>`。本机部署的 `config.json` 已填入随机 token 并**移出版本控制**（模板见 `host/config.example.json`）。
+  - 调用方需同步：MCP 客户端在 `mcp.json` 里加 `headers.Authorization`；脚本读 `host/config.json` 或设环境变量 `WEBTOOPENAPI_TOKEN`。
+  - 关闭鉴权：把 `token` 置空即可（不建议；`chrome_javascript` 能在你的登录态里执行任意 JS）。
+- **不要绑定 `0.0.0.0`**：那等于把「操控你浏览器」的能力暴露到局域网/公网。即使有 token 也不要。
 - **用途合规**：请仅用于你本人有合法访问权限的账号与服务，遵守目标站点的使用条款与 robots 约定。
 
 ## 打包发布

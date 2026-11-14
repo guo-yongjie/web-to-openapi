@@ -6,6 +6,8 @@ host/extension-key.json
 *.pem
 *.crx
 *.p12
+# v1.7.1: config.json 现在持有 API token, 必须本地化。模板见 host/config.example.json
+host/config.json
 
 # ---------------------------------------------------------------------------
 # 一次性开发脚本(品牌迁移 / 反汇编探针, 含本机绝对路径)
