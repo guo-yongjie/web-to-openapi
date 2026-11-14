@@ -237,6 +237,56 @@ function safeParse(s) {
   try { return JSON.parse(s); } catch (e) { return null; }
 }
 
+/*
+ * 滚动: chrome_computer 的 scroll 走 CDP Input.dispatchMouseEvent(mouseWheel), 是真输入。
+ * 参数 coordinates(可选, 滚动的锚点) + scrollDirection + scrollAmount。
+ */
+async function dispatchScroll(tabId, target, opts) {
+  const o = opts || {};
+  const args = { tabId, action: "scroll" };
+  if (target && target.cx != null) args.coordinates = { x: target.cx, y: target.cy };
+  if (o.direction) args.scrollDirection = o.direction;
+  if (o.amount) args.scrollAmount = Math.max(1, Math.min(o.amount, 10));
+  await activateTab(tabId);
+  try {
+    const data = await callTool("chrome_computer", args, o.timeout_ms || 30000);
+    const parsed = safeParse(dataText(data));
+    if (parsed && parsed.success === false) {
+      return { dispatched: false, error: String(parsed.error || "scroll failed").slice(0, 200) };
+    }
+    return { dispatched: true, deltaX: (parsed && parsed.deltaX) || 0, deltaY: (parsed && parsed.deltaY) || 0, raw: parsed };
+  } catch (e) {
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
+/*
+ * 拖拽: chrome_computer 的 left_click_drag 走 CDP(moved→pressed→moved→released), 真输入。
+ * 参数 startCoordinates(起点) + coordinates(终点)。
+ */
+async function dispatchDrag(tabId, fromTarget, toTarget, opts) {
+  const o = opts || {};
+  const args = {
+    tabId,
+    action: "left_click_drag",
+    startCoordinates: { x: fromTarget.cx, y: fromTarget.cy },
+    coordinates: { x: toTarget.cx, y: toTarget.cy },
+  };
+  await activateTab(tabId);
+  try {
+    const data = await callTool("chrome_computer", args, o.timeout_ms || 30000);
+    const parsed = safeParse(dataText(data));
+    if (parsed && parsed.success === false) {
+      return { dispatched: false, error: String(parsed.error || "drag failed").slice(0, 200) };
+    }
+    return { dispatched: true, raw: parsed };
+  } catch (e) {
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
 // ---------------------------------------------------------------- settle
 async function settle(tabId, ref, res, expect, maxMs) {
   const base = Object.assign({}, res.before || {}, { base: res.base || null });
@@ -436,4 +486,192 @@ async function type(o) {
   });
 }
 
-module.exports = { observe, click, type, INPUT_KIND };
+// ---------------------------------------------------------------- find
+/*
+ * 语义查找: 在 observe 登记过的集合里按 label/placeholder/name/id/text/role/tag/type 匹配。
+ * filters: [{field, value, op}]。只查已知集合(known-set), 不定位没 observe 过的新元素。
+ */
+async function find(opts) {
+  const o = opts || {};
+  const filters = o.filters || [];
+  const code = probe.findScript(filters, o.max);
+  const { tabId, out } = await evalInPage(o.tabId, code, o.timeout_ms);
+  log("action", `find tab=${tabId} tok=${out.tok} count=${out.count}`);
+  return {
+    ok: true,
+    tab_id: tabId,
+    page_token: out.tok,
+    count: out.count,
+    truncated: !!out.truncated,
+    matches: out.matches || [],
+    hint: "把 matches[].ref 原样传给 act/click|type|scroll|drag; 页面重新加载后旧 ref 失效, 重新 observe + find 即可。",
+  };
+}
+
+// ---------------------------------------------------------------- scroll
+/*
+ * 滚动。两种模式:
+ *   带 ref   -> 先门禁校验该元素, 以它为锚点滚动到视口(扩展以坐标处发 mouseWheel)
+ *   带 direction(up/down/left/right) + amount -> 直接滚动页面(无 ref, 不做归因取证)
+ * 滚动走 CDP mouseWheel 真输入, 且不是不可逆写操作, 归因要求比 click/type 宽松。
+ */
+async function scroll(opts) {
+  const o = opts || {};
+  if (!o.ref && !o.direction) {
+    const e = new Error("act/scroll 需要 ref 或 direction(up/down/left/right)");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+  let tabId = o.tabId;
+  let target = null;
+  let res = null;
+
+  if (o.ref) {
+    const r0 = await resolveTarget(o.tabId, o.ref, wantTokOf(o.ref, o.page_token), o.quiet_ms);
+    res = r0.res;
+    tabId = r0.tabId;
+    if (res.stale) {
+      log("action", `scroll rejected: ${res.stale} ref=${o.ref}`);
+      return receipt({
+        stale: res.stale,
+        stale_reason: res.why,
+        target: { ref: o.ref },
+        dispatched: false,
+        hit: res.hit,
+        retryable: res.stale === "REF_NOT_PRESENTED" || res.stale === "NOT_VISIBLE",
+        note: "派发前门禁拒绝, 浏览器未收到任何输入。",
+      });
+    }
+    target = res.target;
+  }
+
+  const d = await dispatchScroll(tabId, target, o);
+  if (d.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: d.dispatched,
+      mechanism: "wheel",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d.dispatched === false,
+      note: d.dispatched === "unknown"
+        ? "滚动结果未知(超时): 可能已滚动, 请重新 observe 确认页面位置。"
+        : "滚动失败: " + (d.error || "unknown"),
+    });
+  }
+
+  if (!res) {
+    return receipt({
+      target: null,
+      input_kind: "trusted",
+      dispatched: true,
+      mechanism: "wheel",
+      effect: {
+        verdict: "none",
+        signals: [`wheel:${d.deltaX},${d.deltaY}`],
+        elapsed_ms: Date.now() - t0,
+      },
+      postcondition: { met: true, checks: [] },
+      retryable: false,
+    });
+  }
+
+  const s = await settle(tabId, o.ref, res, o.expect, o.settle_ms);
+  const verdict = verdictOf(s, res.quiet);
+  return receipt({
+    target,
+    input_kind: "trusted",
+    dispatched: true,
+    mechanism: "wheel",
+    hit: target.hit,
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, o.expect),
+    retryable: verdict === "none",
+  });
+}
+
+// ---------------------------------------------------------------- drag
+/*
+ * 拖拽。from 必须给 ref; to 给 ref 或 to_x/to_y 坐标。
+ * 两个端点都要过门禁(resolve); CDP 序列 moved→pressed→moved→released 全真输入。
+ */
+async function drag(opts) {
+  const o = opts || {};
+  if (!o.from) {
+    const e = new Error("act/drag 需要 from(ref)");
+    e.status = 400;
+    throw e;
+  }
+  if (!o.to && (o.to_x == null || o.to_y == null)) {
+    const e = new Error("act/drag 需要 to(ref) 或 to_x/to_y(坐标)");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+
+  const r0 = await resolveTarget(o.tabId, o.from, wantTokOf(o.from, o.page_token), o.quiet_ms);
+  const res = r0.res;
+  const tabId = r0.tabId;
+  if (res.stale) {
+    log("action", `drag rejected(from): ${res.stale} ref=${o.from}`);
+    return receipt({
+      stale: res.stale,
+      stale_reason: res.why,
+      target: { ref: o.from },
+      dispatched: false,
+      hit: res.hit,
+      retryable: res.stale === "REF_NOT_PRESENTED" || res.stale === "NOT_VISIBLE",
+      note: "派发前门禁拒绝(from 端点), 浏览器未收到任何输入。",
+    });
+  }
+  const fromTarget = res.target;
+
+  let toTarget;
+  if (o.to) {
+    const r1 = await resolveTarget(tabId, o.to, wantTokOf(o.to, o.page_token), o.quiet_ms);
+    if (r1.res.stale) {
+      log("action", `drag rejected(to): ${r1.res.stale} ref=${o.to}`);
+      return receipt({
+        stale: r1.res.stale,
+        stale_reason: r1.res.why,
+        target: { ref: o.to },
+        dispatched: false,
+        hit: r1.res.hit,
+        retryable: r1.res.stale === "REF_NOT_PRESENTED" || r1.res.stale === "NOT_VISIBLE",
+        note: "派发前门禁拒绝(to 端点), 浏览器未收到任何输入。",
+      });
+    }
+    toTarget = r1.res.target;
+  } else {
+    toTarget = { cx: Math.round(Number(o.to_x)), cy: Math.round(Number(o.to_y)) };
+  }
+
+  const d = await dispatchDrag(tabId, fromTarget, toTarget, o);
+  if (d.dispatched !== true) {
+    return receipt({
+      target: { from: fromTarget, to: toTarget },
+      dispatched: d.dispatched,
+      mechanism: "drag",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d.dispatched === false,
+      note: d.dispatched === "unknown"
+        ? "拖拽结果未知(超时): 可能已生效, 请重新 observe 确认。"
+        : "拖拽失败: " + (d.error || "unknown"),
+    });
+  }
+
+  const s = await settle(tabId, o.from, res, o.expect, o.settle_ms);
+  const verdict = verdictOf(s, res.quiet);
+  return receipt({
+    target: { from: fromTarget, to: toTarget },
+    input_kind: "trusted",
+    dispatched: true,
+    mechanism: "drag",
+    hit: fromTarget.hit,
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, o.expect),
+    retryable: verdict === "none",
+  });
+}
+
+module.exports = { observe, click, type, find, scroll, drag, INPUT_KIND };

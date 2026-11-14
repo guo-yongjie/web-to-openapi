@@ -200,6 +200,9 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | `browser_observe` | `POST /api/v1/act/observe` | 可信动作层：观察可交互元素，分配 ref + page_token（点击/输入前置） |
 | `browser_click` | `POST /api/v1/act/click` | 可信动作层：点击 ref 并返回 ActionReceipt（派发门禁 + 收敛取证） |
 | `browser_type` | `POST /api/v1/act/type` | 可信动作层：聚焦 ref 键入文本并返回 ActionReceipt（回执不回明文） |
+| `browser_find` | `POST /api/v1/act/find` | 可信动作层：按 label/placeholder/name/id/text 等语义字段查找已观察元素，返回 ref |
+| `browser_scroll` | `POST /api/v1/act/scroll` | 可信动作层：滚动页面（direction+amount）或滚动到某 ref（CDP 真输入） |
+| `browser_drag` | `POST /api/v1/act/drag` | 可信动作层：拖拽 from→to（ref 或坐标），两端点过门禁，返回 ActionReceipt |
 
 列表参数（site/intitle/inurl/intext/exclude/or）传数组（`["a.com","b.com"]`）或逗号分隔字符串均可；默认参数三层合并逻辑与 REST 完全一致（请求 > 设置页默认 > 内置）。
 
@@ -232,6 +235,9 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | POST | `/api/v1/act/observe` | **可信动作层**：观察页面可交互元素，分配 ref 与 page_token（点击/输入的前置步骤） |
 | POST | `/api/v1/act/click` | **可信动作层**：点击 ref，返回 ActionReceipt（派发前门禁 + 收敛取证 + 结构化回执） |
 | POST | `/api/v1/act/type` | **可信动作层**：聚焦 ref 并键入文本，返回 ActionReceipt（回执只含长度与前 3 字符，不回明文） |
+| POST | `/api/v1/act/find` | **可信动作层**：按语义字段（label/placeholder/name/id/text/role/tag/type）查找已观察元素，返回匹配 ref 列表 |
+| POST | `/api/v1/act/scroll` | **可信动作层**：滚动页面（direction+amount）或滚动到某 ref（CDP mouseWheel 真输入） |
+| POST | `/api/v1/act/drag` | **可信动作层**：拖拽 from→to（ref 或 to_x/to_y 坐标），两端点过门禁，返回 ActionReceipt |
 
 > 示例接口 `scnet/free-credit`、`scnet/token-plan`、`search/baidu`、`search/google` 只是「用浏览器能力封装一个 Web API」的样板。新增任何 Web 能力（如页面正文提取、表单自动化）都走同一套机制，成熟后会作为预置端点陆续加入。
 

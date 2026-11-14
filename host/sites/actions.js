@@ -38,6 +38,26 @@ function parseInput(input) {
     if (k) expect.push({ expect: String(k), value: sp.get("expect_value") });
   }
 
+  // find 的 filters: 支持 filters 数组、单 field/value 对(GET)、或简写字段名
+  const FILTER_FIELDS = ["text", "name", "label", "placeholder", "id", "role", "tag", "type"];
+  const filters = [];
+  if (raw && Array.isArray(raw.filters)) {
+    for (const f of raw.filters) {
+      if (f && typeof f === "object" && f.field) {
+        filters.push({ field: String(f.field), value: f.value, op: f.op || "contains" });
+      }
+    }
+  } else if (isSp) {
+    const f = sp.get("field");
+    if (f) filters.push({ field: String(f), value: sp.get("value"), op: sp.get("op") || "contains" });
+  } else if (raw) {
+    for (const k of Object.keys(raw)) {
+      if (FILTER_FIELDS.indexOf(k) >= 0) {
+        filters.push({ field: k, value: raw[k], op: "contains" });
+      }
+    }
+  }
+
   const tabIdRaw = sp.get("tabId") || sp.get("tab_id");
   return {
     tabId: tabIdRaw == null || tabIdRaw === "" ? null : num(tabIdRaw, null),
@@ -50,6 +70,13 @@ function parseInput(input) {
     settle_ms: num(sp.get("settle_ms"), undefined),
     timeout_ms: num(sp.get("timeout_ms"), undefined),
     expect,
+    filters,
+    direction: sp.get("direction") || null,
+    amount: num(sp.get("amount"), undefined),
+    from: sp.get("from") || null,
+    to: sp.get("to") || null,
+    to_x: sp.get("to_x") == null ? undefined : num(sp.get("to_x"), undefined),
+    to_y: sp.get("to_y") == null ? undefined : num(sp.get("to_y"), undefined),
     // 三态: 不传 = undefined(action.js 默认开启真输入); 显式 false 才关闭。
     // (bug 修复: 原先 truthy() 把"未传"折叠成 false, 导致 forceCdp 永远关着, 点击落到
     //  clickTool 合成路径 —— 那条路坐标缩放有 bug, 会点到别的元素上。)
@@ -95,6 +122,39 @@ async function runType(p) {
     quiet_ms: p.quiet_ms,
     timeout_ms: p.timeout_ms,
     forceCdp: p.forceCdp,
+  });
+}
+
+async function runFind(p) {
+  return await action.find({ tabId: p.tabId, filters: p.filters, max: p.max, timeout_ms: p.timeout_ms });
+}
+
+async function runScroll(p) {
+  return await action.scroll({
+    tabId: p.tabId,
+    ref: p.ref,
+    page_token: p.page_token,
+    direction: p.direction,
+    amount: p.amount,
+    expect: p.expect,
+    settle_ms: p.settle_ms,
+    quiet_ms: p.quiet_ms,
+    timeout_ms: p.timeout_ms,
+  });
+}
+
+async function runDrag(p) {
+  return await action.drag({
+    tabId: p.tabId,
+    from: p.from,
+    to: p.to,
+    to_x: p.to_x,
+    to_y: p.to_y,
+    page_token: p.page_token,
+    expect: p.expect,
+    settle_ms: p.settle_ms,
+    quiet_ms: p.quiet_ms,
+    timeout_ms: p.timeout_ms,
   });
 }
 
@@ -178,6 +238,68 @@ module.exports = {
         slow: true,
       },
     },
+    {
+      method: "POST",
+      methods: ["POST", "GET"],
+      path: "/api/v1/act/find",
+      tool: "browser_find",
+      operationId: "actFind",
+      summary: "按语义字段查找已观察元素",
+      description:
+        "在 observe 登记过的集合里按 label/placeholder/name/id/text/role/tag/type 查找, 返回匹配 ref 列表。只查已知集合(known-set), 不定位没 observe 过的新元素。filters 数组 [{field,value,op}] 或简写字段名(如 {\"placeholder\":\"手机号\"})。",
+      example: { filters: [{ field: "placeholder", value: "手机号" }] },
+      responses: { 200: { description: "匹配清单 + page_token" }, 500: { description: "页面脚本执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runFind,
+      doc: {
+        note: "语义定位: 先 observe 再 find, 把 matches[].ref 传给后续动作。跨刷新自动重建(重新 observe + find)。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/find \\
+  -H "Content-Type: application/json" \\
+  -d '{"filters":[{"field":"placeholder","value":"手机号"}]}'`,
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/v1/act/scroll",
+      tool: "browser_scroll",
+      operationId: "actScroll",
+      summary: "滚动页面或滚动到某元素",
+      description:
+        "两种模式: 带 ref 则先门禁校验该元素并以它为锚点滚动到视口; 带 direction(up/down/left/right)+amount 则直接滚动页面(amount 1-10, 单位 100px)。走 CDP mouseWheel 真输入。",
+      example: { direction: "down", amount: 3 },
+      responses: { 200: { description: "ActionReceipt" }, 400: { description: "缺少 ref 或 direction" }, 500: { description: "执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runScroll,
+      doc: {
+        note: "滚动。带 ref 会做门禁 + 取证; 只带 direction 则直接滚(不做归因)。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/scroll \\
+  -H "Content-Type: application/json" \\
+  -d '{"direction":"down","amount":3}'`,
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/v1/act/drag",
+      tool: "browser_drag",
+      operationId: "actDrag",
+      summary: "拖拽元素并返回 ActionReceipt",
+      description:
+        "from 必须给 ref; to 给 ref 或 to_x/to_y 坐标。两个端点都过门禁, CDP 序列 moved→pressed→moved→released 全真输入。返回 ActionReceipt, 字段同 click。",
+      example: { from: "p3k2.r3", to: "p3k2.r9" },
+      responses: { 200: { description: "ActionReceipt" }, 400: { description: "缺少 from 或 to" }, 500: { description: "执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runDrag,
+      doc: {
+        note: "拖拽。to 可以是 ref 或坐标(to_x/to_y)。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/drag \\
+  -H "Content-Type: application/json" \\
+  -d '{"from":"p3k2.r3","to_x":400,"to_y":300}'`,
+        slow: true,
+      },
+    },
   ],
   tools: [
     {
@@ -234,6 +356,76 @@ module.exports = {
       },
       browser: true,
       run: runType,
+    },
+    {
+      name: "browser_find",
+      description:
+        "按语义字段在 browser_observe 登记过的元素里查找, 返回匹配 ref 列表。field 支持 label(关联label文本)/placeholder/name(name属性)/id/text(可读名称)/role/tag/type; op 支持 contains(默认)/equals/starts_with。这是表单填写的定位入口: 先 observe 再 find(如 placeholder=手机号) 拿 ref, 再交给 click/type。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          filters: {
+            type: "array",
+            description: "匹配条件, 多条取交集(AND)",
+            items: {
+              type: "object",
+              properties: {
+                field: { type: "string", enum: ["text", "name", "label", "placeholder", "id", "role", "tag", "type"] },
+                value: { type: "string", description: "要匹配的值" },
+                op: { type: "string", enum: ["contains", "equals", "starts_with"], description: "默认 contains" },
+              },
+              required: ["field", "value"],
+            },
+          },
+          tabId: { type: "integer", description: "目标标签页 id; 省略则用当前活动标签" },
+          max: { type: "integer", minimum: 1, maximum: 300, description: "最多返回多少个匹配(默认 50)" },
+        },
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runFind,
+    },
+    {
+      name: "browser_scroll",
+      description:
+        "滚动页面或滚动到指定元素并返回 ActionReceipt。带 ref 时先门禁校验并以它为锚点滚动到视口; 带 direction(up/down/left/right)+amount(1-10, 单位 100px) 则直接滚动页面。走 CDP mouseWheel 真输入。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "滚动到该 ref 元素(可选; 与 direction 二选一)" },
+          direction: { type: "string", enum: ["up", "down", "left", "right"], description: "滚动方向" },
+          amount: { type: "integer", minimum: 1, maximum: 10, description: "滚动量(单位 100px, 默认 3)" },
+          tabId: { type: "integer", description: "目标标签页 id" },
+          page_token: { type: "string", description: "browser_observe 返回的 page_token" },
+          expect: EXPECT_SCHEMA,
+          settle_ms: { type: "integer", minimum: 200, maximum: 8000, description: "取证收敛上限(默认 1500)" },
+        },
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runScroll,
+    },
+    {
+      name: "browser_drag",
+      description:
+        "拖拽元素并返回 ActionReceipt。from 必须给 browser_observe 返回的 ref; to 给 ref 或 to_x/to_y 坐标。两个端点都过门禁, CDP 序列 moved→pressed→moved→released 全真输入。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "拖拽起点 ref" },
+          to: { type: "string", description: "拖拽终点 ref(与 to_x/to_y 二选一)" },
+          to_x: { type: "integer", description: "终点 x 坐标(视口)" },
+          to_y: { type: "integer", description: "终点 y 坐标(视口)" },
+          tabId: { type: "integer", description: "目标标签页 id" },
+          page_token: { type: "string", description: "browser_observe 返回的 page_token" },
+          expect: EXPECT_SCHEMA,
+          settle_ms: { type: "integer", minimum: 200, maximum: 8000, description: "取证收敛上限(默认 1500)" },
+        },
+        required: ["from"],
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runDrag,
     },
   ],
 };

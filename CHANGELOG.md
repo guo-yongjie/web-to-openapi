@@ -7,6 +7,24 @@
 
 ---
 
+## [1.9.0] - 2026-11-14
+
+**动作层能力补齐（语义定位 + 滚动 + 拖拽）**：可信动作层从「observe/click/type」扩展到「observe/find/click/type/scroll/drag」，为表单自动填写补齐定位与页面操作能力。全部复用既有 resolve 门禁 / dispatch 真输入 / settle 取证 / ActionReceipt 机制，扩展侧零改动。
+
+### 新增
+- `act/find` + MCP `browser_find`：按语义字段（label/placeholder/name/id/text/role/tag/type）在 observe 登记过的集合里查找，返回匹配 ref 列表。`op` 支持 contains/equals/starts_with，多条 filters 取交集。这是表单填写的定位入口——「先 observe 再 find(placeholder=手机号) 拿 ref，再 click/type」。
+- `act/scroll` + MCP `browser_scroll`：两种模式——带 ref 先门禁校验并以元素中心为锚点滚动到视口（走 settle 取证）；带 direction(up/down/left/right)+amount(1-10, 单位 100px) 直接滚动页面。走扩展 scroll（CDP mouseWheel 真输入）。
+- `act/drag` + MCP `browser_drag`：from 必须给 ref，to 给 ref 或 to_x/to_y 坐标；两端点都过门禁，走扩展 left_click_drag（CDP moved→pressed→moved→released 真输入序列）。
+- `observe` 每个元素新增 `label`（关联 <label> 文本）、`placeholder`、`id`、`name_attr`（HTML name 属性）四个语义字段，向后兼容（原 `name` 字段仍是可读名称）。
+
+### 说明
+- 扩展侧**零改动**：scroll/drag 扩展早已具备（chrome_computer 的 scroll 走 CDP mouseWheel、left_click_drag 走 CDP 序列），本轮只是 host 动作层把它们封装成带回执的受控动作。
+- scroll/drag 的 `input_kind` 标 `trusted`（两者都是 CDP 真输入，无合成路径）。
+
+### 改动
+- 版本号 1.8.1 → 1.9.0（`host/lib/config.js`）。
+- `docs/写操作契约.md`：补 find/scroll/drag 的参数与回执说明。
+
 ## [1.8.1] - 2026-11-14
 
 ### Fixed

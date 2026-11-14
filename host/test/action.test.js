@@ -44,6 +44,7 @@ function mock(impl) {
     if (name !== "chrome_javascript") throw new Error("unexpected tool: " + name);
     const code = args.code || "";
     if (code.indexOf("var LIMIT =") >= 0) return page(impl.settle ? impl.settle() : { verdict: "none", checks: [] });
+    if (code.indexOf("var FILTERS =") >= 0) return page(impl.find ? impl.find() : {});
     if (code.indexOf("var REF =") >= 0) return page(impl.resolve ? impl.resolve() : {});
     if (code.indexOf("var SEL =") >= 0) return page(impl.observe ? impl.observe() : {});
     throw new Error("unrecognized injected script");
@@ -270,5 +271,101 @@ test("type: 先点击聚焦再键入, 顺序与机制正确", async () => {
 test("type: 缺少 text 直接 400, 不碰浏览器", async () => {
   mock({});
   await assert.rejects(() => action.type({ ref: "p1a.r9" }), (e) => e.status === 400);
+  assert.strictEqual(calls.length, 0);
+});
+
+// ------------------------------------------------------------- find
+test("find: 语义匹配返回 matches, 不派发任何输入", async () => {
+  mock({
+    find: () => ({
+      tok: "p1a.r",
+      count: 1,
+      truncated: false,
+      matches: [
+        { ref: "p1a.r5", tag: "input", role: "textbox", name: "手机号", label: null, placeholder: "请输入手机号", id: "mobile", name_attr: "phone" },
+      ],
+    }),
+  });
+  const r = await action.find({ tabId: TAB, filters: [{ field: "placeholder", value: "手机号" }] });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.count, 1);
+  assert.strictEqual(r.matches[0].ref, "p1a.r5");
+  assert.strictEqual(r.matches[0].placeholder, "请输入手机号");
+  assert.strictEqual(CALLS_TO_TOOL("chrome_computer"), 0, "find 不派发输入");
+});
+
+// ------------------------------------------------------------- scroll
+test("scroll(direction): 直接滚动页面, 不 resolve 不 settle", async () => {
+  mock({
+    computer: (args) => ({ success: true, action: "scroll", coordinates: null, deltaX: 0, deltaY: 300 }),
+  });
+  const r = await action.scroll({ direction: "down", amount: 3 });
+  assert.strictEqual(r.dispatched, true);
+  assert.strictEqual(r.mechanism, "wheel");
+  assert.strictEqual(r.input_kind, "trusted");
+  const cpu = calls.filter((c) => c.name === "chrome_computer");
+  assert.strictEqual(cpu.length, 1);
+  assert.strictEqual(cpu[0].args.action, "scroll");
+  assert.strictEqual(cpu[0].args.scrollDirection, "down");
+  assert.strictEqual(cpu[0].args.scrollAmount, 3);
+  assert.strictEqual(CALLS_TO_TOOL("chrome_javascript"), 0, "direction 模式不注入任何脚本");
+});
+
+test("scroll(ref): 先门禁再滚动, 走 settle 取证", async () => {
+  mock({ resolve: () => resolveOk(), settle: () => CHANGED });
+  const r = await action.scroll({ ref: "p1a.r3" });
+  assert.strictEqual(r.dispatched, true);
+  assert.strictEqual(r.effect.verdict, "changed");
+  const cpu = calls.filter((c) => c.name === "chrome_computer");
+  assert.strictEqual(cpu[0].args.coordinates.x, 420, "以 ref 元素中心为滚动锚点");
+  assert.strictEqual(cpu[0].args.coordinates.y, 310);
+});
+
+test("scroll: 缺少 ref 和 direction -> 400", async () => {
+  mock({});
+  await assert.rejects(() => action.scroll({}), (e) => e.status === 400);
+  assert.strictEqual(calls.length, 0);
+});
+
+// ------------------------------------------------------------- drag
+test("drag(ref->ref): 两个端点都过门禁, 走 CDP 拖拽并 settle", async () => {
+  mock({ resolve: () => resolveOk(), settle: () => CHANGED });
+  const r = await action.drag({ from: "p1a.r3", to: "p1a.r9" });
+  assert.strictEqual(r.dispatched, true);
+  assert.strictEqual(r.mechanism, "drag");
+  assert.strictEqual(r.input_kind, "trusted");
+  assert.strictEqual(r.effect.verdict, "changed");
+  const cpu = calls.filter((c) => c.name === "chrome_computer");
+  assert.strictEqual(cpu.length, 1);
+  assert.strictEqual(cpu[0].args.action, "left_click_drag");
+  assert.deepStrictEqual(cpu[0].args.startCoordinates, { x: 420, y: 310 });
+  assert.deepStrictEqual(cpu[0].args.coordinates, { x: 420, y: 310 });
+  assert.strictEqual(CALLS_TO_TOOL("chrome_javascript"), 3, "resolve(from) + resolve(to) + settle");
+});
+
+test("drag(ref->坐标): to 用 to_x/to_y, 只 resolve 起点一次", async () => {
+  mock({ resolve: () => resolveOk(), settle: () => CHANGED });
+  const r = await action.drag({ from: "p1a.r3", to_x: 500, to_y: 600 });
+  assert.strictEqual(r.dispatched, true);
+  const cpu = calls.filter((c) => c.name === "chrome_computer");
+  assert.deepStrictEqual(cpu[0].args.coordinates, { x: 500, y: 600 });
+  assert.strictEqual(CALLS_TO_TOOL("chrome_javascript"), 2, "resolve(from) + settle");
+});
+
+test("drag: to 端点 stale -> 拒绝且不派发", async () => {
+  let n = 0;
+  mock({
+    resolve: () => (++n === 1 ? resolveOk() : { stale: "NOT_VISIBLE", tok: "p1a.r", hit: "self", why: "元素不可见" }),
+  });
+  const r = await action.drag({ from: "p1a.r3", to: "p1a.r9" });
+  assert.strictEqual(r.stale, "NOT_VISIBLE");
+  assert.strictEqual(r.dispatched, false);
+  assert.strictEqual(CALLS_TO_TOOL("chrome_computer"), 0);
+});
+
+test("drag: 缺少 from 或 to -> 400", async () => {
+  mock({});
+  await assert.rejects(() => action.drag({ from: "p1a.r3" }), (e) => e.status === 400);
+  await assert.rejects(() => action.drag({}), (e) => e.status === 400);
   assert.strictEqual(calls.length, 0);
 });

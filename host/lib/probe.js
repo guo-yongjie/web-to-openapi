@@ -70,6 +70,28 @@ function w2oRole(el){
   }
   return t;
 }
+// 关联 <label> 文本(语义定位用): 优先原生 labels, 再 label[for=id], 再包裹的 label
+function w2oLabel(el){
+  var s = '';
+  try{
+    if(el.labels && el.labels.length){
+      s = (el.labels[0].innerText || el.labels[0].textContent || '').replace(/\\s+/g,' ').trim();
+    }
+  }catch(e){}
+  if(!s && el.id){
+    try{
+      var l = document.querySelector('label[for="' + el.id + '"]');
+      if(l) s = (l.innerText || l.textContent || '').replace(/\\s+/g,' ').trim();
+    }catch(e){}
+  }
+  if(!s && el.closest){
+    try{
+      var p = el.closest('label');
+      if(p) s = (p.innerText || p.textContent || '').replace(/\\s+/g,' ').trim();
+    }catch(e){}
+  }
+  return s ? s.slice(0, 40) : null;
+}
 function w2oCenter(el){
   var r = el.getBoundingClientRect();
   return { cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2) };
@@ -155,6 +177,10 @@ for(var i = 0; i < all.length && out.length < limit; i++){
     role: w2oRole(el),
     name: w2oText(el, 40),
     type: el.type || null,
+    label: w2oLabel(el),
+    placeholder: el.getAttribute('placeholder') || null,
+    id: el.id || null,
+    name_attr: el.getAttribute('name') || null,
     disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
     rect: { x: Math.round(el.getBoundingClientRect().left), y: Math.round(el.getBoundingClientRect().top), cx: c.cx, cy: c.cy },
     hit: hit,
@@ -305,4 +331,64 @@ return {
 `;
 }
 
-module.exports = { observeScript, resolveScript, settleScript };
+/*
+ * FIND: 按语义字段在已观察集合里查找, 返回匹配 ref 列表(含识别信息)。
+ * filters: [{field, value, op}], field ∈ text/name/label/placeholder/id/role/tag/type
+ *   op: contains(默认) / equals / starts_with
+ * 只查 observe 登记过的元素(known-set 不变量), 不跨过 observe 直接定位新元素。
+ */
+function findScript(filters, maxN) {
+  const limit = Math.max(1, Math.floor(maxN == null ? 50 : maxN));
+  return `${PRELUDE}${HELPERS}
+var FILTERS = ${JSON.stringify(filters || [])};
+var MAXN = ${limit};
+function recOf(el, ref){
+  return {
+    ref: ref,
+    tag: el.tagName.toLowerCase(),
+    role: w2oRole(el),
+    name: w2oText(el, 40),
+    type: el.type || null,
+    label: w2oLabel(el),
+    placeholder: el.getAttribute('placeholder') || null,
+    id: el.id || null,
+    name_attr: el.getAttribute('name') || null,
+    disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true')
+  };
+}
+function fieldOf(rec, field){
+  if(field === 'text') return rec.name;
+  if(field === 'name') return rec.name_attr;
+  if(field === 'label') return rec.label;
+  if(field === 'placeholder') return rec.placeholder;
+  if(field === 'id') return rec.id;
+  if(field === 'role') return rec.role;
+  if(field === 'tag') return rec.tag;
+  if(field === 'type') return rec.type;
+  return null;
+}
+var keys = Object.keys(window.__w2o.refs);
+var matches = [];
+for(var i = 0; i < keys.length && matches.length < MAXN; i++){
+  var el = w2oFind(keys[i]);
+  if(!el || !w2oVisible(el)) continue;
+  var rec = recOf(el, keys[i]);
+  var ok = true;
+  for(var j = 0; j < FILTERS.length; j++){
+    var f = FILTERS[j] || {};
+    var actual = String(fieldOf(rec, f.field) || '');
+    var want = String(f.value == null ? '' : f.value);
+    var op = f.op || 'contains';
+    var hit = false;
+    if(op === 'equals') hit = actual === want;
+    else if(op === 'starts_with') hit = actual.indexOf(want) === 0;
+    else hit = actual.indexOf(want) >= 0;
+    if(!hit){ ok = false; break; }
+  }
+  if(ok) matches.push(rec);
+}
+return { tok: window.__w2o.tok, count: matches.length, truncated: matches.length >= LIMIT, matches: matches };
+`;
+}
+
+module.exports = { observeScript, resolveScript, settleScript, findScript };
