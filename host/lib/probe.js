@@ -338,7 +338,7 @@ return {
  * 只查 observe 登记过的元素(known-set 不变量), 不跨过 observe 直接定位新元素。
  */
 function findScript(filters, maxN) {
-  const limit = Math.max(1, Math.floor(maxN == null ? 50 : maxN));
+  const limit = Math.max(1, Math.floor(maxN || 50));
   return `${PRELUDE}${HELPERS}
 var FILTERS = ${JSON.stringify(filters || [])};
 var MAXN = ${limit};
@@ -387,7 +387,7 @@ for(var i = 0; i < keys.length && matches.length < MAXN; i++){
   }
   if(ok) matches.push(rec);
 }
-return { tok: window.__w2o.tok, count: matches.length, truncated: matches.length >= LIMIT, matches: matches };
+return { tok: window.__w2o.tok, count: matches.length, truncated: matches.length >= MAXN, matches: matches };
 `;
 }
 

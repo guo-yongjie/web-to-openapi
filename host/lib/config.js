@@ -85,9 +85,9 @@ function loadConfig() {
 
 const CONFIG = loadConfig();
 const SERVICE = "web-to-openapi";
-// 本地加固版本号(v1.9.0: 动作层语义定位 find + scroll + drag)。
+// 本地加固版本号(v1.9.1: 修 find 的 MAXN/LIMIT 变量名 + num 把 null 解析成 0 的回归)。
 // 上游发版时请核对 diff 后再合并。
-const VERSION = "1.9.0";
+const VERSION = "1.9.1";
 
 // 本地状态目录(默认参数持久化也放这里)
 const STATE_DIR = process.env.LOCALAPPDATA || HOST_DIR;

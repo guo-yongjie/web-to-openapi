@@ -7,6 +7,17 @@
 
 ---
 
+## [1.9.1] - 2026-11-14
+
+**修 `act/find` 真机暴露的两个回归**（v1.9.0 单测全 mock、未执行真实页面脚本，故没拦住）：
+
+1. `findScript` 里 `truncated` 表达式引用了未定义变量 `LIMIT`（复制 observe 代码时漏改），导致 `act/find` 报 `ReferenceError: LIMIT is not defined`。改为正确的 `MAXN`。
+2. `actions.js` 的 `num()` 把「未传的参数」解析成 `0`：`URLSearchParams.get()` 对不存在的键返回 `null`，而 `Number(null)===0`，于是未传的 `max` 变成 `0` → `findScript` 里 `Math.max(1, 0)=1` → `MAXN=1` → `truncated` 恒为 `true`（count=1 却报截断，语义矛盾）。修复：`null`/`undefined`/空串 一律视为未传、返回默认值。
+- `findScript` 的 limit 兜底从 `maxN == null ? 50 : maxN` 改为 `maxN || 50`，与 `observeScript` 的 `maxN || 120` 语义对齐。
+- 新增 `host/test/actions-parse.test.js`（4 例），锁死 num 的 null/空串解析；测试 80/80 通过。
+
+---
+
 ## [1.9.0] - 2026-11-14
 
 **动作层能力补齐（语义定位 + 滚动 + 拖拽）**：可信动作层从「observe/click/type」扩展到「observe/find/click/type/scroll/drag」，为表单自动填写补齐定位与页面操作能力。全部复用既有 resolve 门禁 / dispatch 真输入 / settle 取证 / ActionReceipt 机制，扩展侧零改动。

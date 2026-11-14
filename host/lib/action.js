@@ -496,7 +496,7 @@ async function find(opts) {
   const filters = o.filters || [];
   const code = probe.findScript(filters, o.max);
   const { tabId, out } = await evalInPage(o.tabId, code, o.timeout_ms);
-  log("action", `find tab=${tabId} tok=${out.tok} count=${out.count}`);
+  log("action", `find tab=${tabId} tok=${out.tok} count=${out.count} max=${o.max}`);
   return {
     ok: true,
     tab_id: tabId,

@@ -15,6 +15,9 @@ const action = require("../lib/action");
 const { toSearchParams, truthy } = require("../lib/util");
 
 function num(v, def) {
+  // URLSearchParams.get() 对不存在的键返回 null, 而 Number(null)===0;
+  // 若不挡掉会把"未传"解析成 0, 导致 find/observe 的 max 被压成 1。null/undefined/空串都视为未传。
+  if (v == null || v === "") return def;
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
