@@ -91,6 +91,12 @@ function parseInput(input) {
       sp.get("splitPress") == null && sp.get("split_press") == null
         ? undefined
         : truthy(sp.get("splitPress") || sp.get("split_press")),
+    // select: value(原生 select 的 option value/文本) 或 option_text(自定义下拉显示文本)
+    value: sp.get("value") == null ? null : String(sp.get("value")),
+    option_text: sp.get("option_text") == null ? null : String(sp.get("option_text")),
+    // run: 多步编排
+    steps: raw && Array.isArray(raw.steps) ? raw.steps : null,
+    continueOnError: truthy(sp.get("continueOnError") || sp.get("continue_on_error")),
   };
 }
 
@@ -157,6 +163,32 @@ async function runDrag(p) {
     expect: p.expect,
     settle_ms: p.settle_ms,
     quiet_ms: p.quiet_ms,
+    timeout_ms: p.timeout_ms,
+  });
+}
+
+async function runSelect(p) {
+  return await action.select({
+    tabId: p.tabId,
+    ref: p.ref,
+    page_token: p.page_token,
+    value: p.value,
+    option_text: p.option_text,
+    expect: p.expect,
+    settle_ms: p.settle_ms,
+    quiet_ms: p.quiet_ms,
+    timeout_ms: p.timeout_ms,
+    forceCdp: p.forceCdp,
+    splitPress: p.splitPress,
+  });
+}
+
+async function runRun(p) {
+  return await action.run({
+    tabId: p.tabId,
+    page_token: p.page_token,
+    steps: p.steps,
+    continueOnError: p.continueOnError,
     timeout_ms: p.timeout_ms,
   });
 }
@@ -303,6 +335,48 @@ module.exports = {
         slow: true,
       },
     },
+    {
+      method: "POST",
+      path: "/api/v1/act/select",
+      tool: "browser_select",
+      operationId: "actSelect",
+      summary: "下拉选择并返回 ActionReceipt",
+      description:
+        "统一处理两种下拉: 原生 <select> 走 JS 设值 + change 事件(快, 但非受信点击, input_kind=synthetic); 自定义下拉(div 模拟) 走 点开触发器 -> 重新 observe -> 按文本找选项 -> 点选项(真输入, trusted)。参数 ref + value(原生, 匹配 option 的 value 或文本) 或 option_text(自定义, 匹配显示文本)。",
+      example: { ref: "p3k2.r7", option_text: "上海市" },
+      responses: { 200: { description: "ActionReceipt" }, 400: { description: "缺少 ref 或 value/option_text" }, 500: { description: "执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runSelect,
+      doc: {
+        note: "下拉选择。原生 select 用 value; 自定义下拉用 option_text(显示文本)。找不到选项时回执会列出可用候选项。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/select \\
+  -H "Content-Type: application/json" \\
+  -d '{"ref":"p3k2.r7","option_text":"上海市"}'`,
+        slow: true,
+      },
+    },
+    {
+      method: "POST",
+      path: "/api/v1/act/run",
+      tool: "browser_run",
+      operationId: "actRun",
+      summary: "多步动作编排(序列执行)",
+      description:
+        "按顺序执行 steps 数组, 每步独立 ActionReceipt 回执。step.action 支持 observe/find/click/type/select/scroll/drag; 其余字段为该动作的参数。默认 fail-fast(任一步失败即停), continueOnError=true 则继续跑完。返回 {ok,total,done,failed_at,continue_on_error,steps:[{index,action,ok,receipt|error}]}。",
+      example: { steps: [{ action: "type", ref: "p3k2.r9", text: "金银花" }, { action: "click", ref: "p3k2.r13" }] },
+      responses: { 200: { description: "编排汇总" }, 400: { description: "缺少 steps" }, 500: { description: "执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runRun,
+      doc: {
+        note: "多步编排。tabId/page_token 可放在顶层(各步继承)或逐条覆盖。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/run \\
+  -H "Content-Type: application/json" \\
+  -d '{"steps":[{"action":"type","ref":"p3k2.r9","text":"金银花"},{"action":"click","ref":"p3k2.r13"}]}'`,
+        slow: true,
+      },
+    },
   ],
   tools: [
     {
@@ -429,6 +503,56 @@ module.exports = {
       },
       browser: true,
       run: runDrag,
+    },
+    {
+      name: "browser_select",
+      description:
+        "下拉选择并返回 ActionReceipt。统一处理两种下拉: 原生 <select> 走 JS 设值 + change 事件(快, input_kind=synthetic); 自定义下拉(div 模拟) 走 点开触发器 -> 重新 observe -> 按文本找选项 -> 点选项(真输入, trusted)。参数 ref + value(原生, 匹配 option 的 value 或文本) 或 option_text(自定义, 匹配显示文本)。找不到选项时回执会列出可用候选项。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "browser_observe 返回的下拉框 ref(原生 select 或自定义下拉触发器)" },
+          value: { type: "string", description: "原生 <select> 要选中的 option value(或显示文本)" },
+          option_text: { type: "string", description: "自定义下拉的选项显示文本" },
+          tabId: { type: "integer", description: "目标标签页 id; 省略则用当前活动标签" },
+          page_token: { type: "string", description: "browser_observe 返回的 page_token" },
+          expect: EXPECT_SCHEMA,
+          settle_ms: { type: "integer", minimum: 200, maximum: 8000, description: "取证收敛上限(默认 1500)" },
+        },
+        required: ["ref"],
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runSelect,
+    },
+    {
+      name: "browser_run",
+      description:
+        "多步动作编排: 按顺序执行 steps 数组, 每步独立 ActionReceipt。step.action 支持 observe/find/click/type/select/scroll/drag, 其余字段为该动作参数。默认 fail-fast(任一步失败即停), continueOnError=true 则继续。返回 {ok,total,done,failed_at,steps}。适合把一次自动填表拆成 观察->定位->填入->提交 的序列一次跑完。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          steps: {
+            type: "array",
+            description: "动作序列; 每项必含 action 字段, 其余为对应动作参数",
+            items: {
+              type: "object",
+              properties: {
+                action: { type: "string", enum: ["observe", "find", "click", "type", "select", "scroll", "drag"] },
+              },
+              required: ["action"],
+              additionalProperties: true,
+            },
+          },
+          tabId: { type: "integer", description: "各步继承的标签页 id; 单步可覆盖" },
+          page_token: { type: "string", description: "各步继承的 page_token; 单步可覆盖" },
+          continueOnError: { type: "boolean", description: "true 则某步失败后继续执行后续步骤(默认 false, fail-fast)" },
+        },
+        required: ["steps"],
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runRun,
     },
   ],
 };

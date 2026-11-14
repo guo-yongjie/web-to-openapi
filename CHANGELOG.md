@@ -7,6 +7,22 @@
 
 ---
 
+## [1.10.0] - 2026-11-14
+
+**动作层补齐 select + run 多步编排**：动作层从 6 个动作扩展到 8 个，为「自动填表单」打通最后两块。
+
+- **`act/select`（`browser_select`）**：统一处理两种下拉。
+  - 原生 `<select>`：JS 设 value + 派发 change 事件（快，但非受信点击，`input_kind=synthetic`），找不到选项时回执列出可用候选项。
+  - 自定义下拉（div 模拟）：点开触发器 → 重新 observe → 按文本 find 选项 → 点选项（真输入 `trusted`）。
+  - `findScript` 的 `recOf` 新增 `cx`/`cy`（find 结果自带坐标，可直接点击，供 select 自定义路径消费）。
+- **`act/run`（`browser_run`）**：多步编排。`steps` 数组逐步执行（每步独立 ActionReceipt），默认 fail-fast、`continueOnError=true` 则继续；返回 `{ok,total,done,failed_at,steps}`。每步可继承 run 级 `tabId`/`page_token` 或单步覆盖。
+- `action.js` 新增 `select()`/`run()` 编排与 `RUNNERS` 分发表；`probe.js` 新增 `nativeSelectScript`。
+- 新增 9 例 mock 测试（select 原生/自定义/选项缺失/缺参 + run 多步/fail-fast/continueOnError/未知动作/缺参），测试 89/89 通过。
+- 真机验收（本地 select 验证页）时发现并修复：`observeScript` 的 `SEL` 选择器漏了 `[role=option]`，导致组件库标准下拉选项（`li[role=option]`）不被采集、`select` 自定义路径找不到选项。已补 `[role=option]`。
+- 扩展侧零改动（select 复用 click + observe + find，run 纯 host 编排）。
+
+---
+
 ## [1.9.1] - 2026-11-14
 
 **修 `act/find` 真机暴露的两个回归**（v1.9.0 单测全 mock、未执行真实页面脚本，故没拦住）：

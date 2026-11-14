@@ -154,7 +154,7 @@ function w2oFind(ref){
 function observeScript(maxN) {
   return `${PRELUDE}${HELPERS}
 var SEL = 'a[href],button,input,select,textarea,summary,' +
-  '[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=switch],' +
+  '[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=switch],[role=option],' +
   '[onclick],[contenteditable=true],[tabindex]:not([tabindex="-1"])';
 var all = [];
 try{ all = Array.prototype.slice.call(document.querySelectorAll(SEL)); }catch(e){}
@@ -343,6 +343,7 @@ function findScript(filters, maxN) {
 var FILTERS = ${JSON.stringify(filters || [])};
 var MAXN = ${limit};
 function recOf(el, ref){
+  var c = w2oCenter(el);
   return {
     ref: ref,
     tag: el.tagName.toLowerCase(),
@@ -353,7 +354,9 @@ function recOf(el, ref){
     placeholder: el.getAttribute('placeholder') || null,
     id: el.id || null,
     name_attr: el.getAttribute('name') || null,
-    disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true')
+    disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+    cx: c.cx,
+    cy: c.cy
   };
 }
 function fieldOf(rec, field){
@@ -391,4 +394,31 @@ return { tok: window.__w2o.tok, count: matches.length, truncated: matches.length
 `;
 }
 
-module.exports = { observeScript, resolveScript, settleScript, findScript };
+/*
+ * NATIVE SELECT: 原生 <select> 设值。JS 设 value + 派发 change/input 事件(非受信点击)。
+ * 仅用于 <select> 快速路径; 自定义下拉(div 模拟)走 click + find + click 组合(见 action.select)。
+ * value 同时匹配 option 的 value 与显示文本(去空白)。
+ */
+function nativeSelectScript(ref, value) {
+  return `${PRELUDE}${HELPERS}
+var REF = ${JSON.stringify(String(ref || ""))};
+var VALUE = ${JSON.stringify(String(value == null ? "" : value))};
+var el = w2oFind(REF);
+if(!el) return { ok:false, why:'element_gone' };
+if(el.tagName.toLowerCase() !== 'select') return { ok:false, why:'not_a_native_select', tag:el.tagName.toLowerCase() };
+var opts = Array.prototype.slice.call(el.options || []);
+var found = null;
+for(var i = 0; i < opts.length; i++){
+  var oi = opts[i];
+  if(String(oi.value) === VALUE || String(oi.text).replace(/\\s+/g,' ').trim() === VALUE){ found = oi; break; }
+}
+if(!found) return { ok:false, why:'option_not_found', available: opts.map(function(x){ return { value: x.value, text: String(x.text).replace(/\\s+/g,' ').trim() }; }).slice(0, 50) };
+var before = el.value;
+el.value = found.value;
+try{ el.dispatchEvent(new Event('change', { bubbles: true })); }catch(e){}
+try{ el.dispatchEvent(new Event('input', { bubbles: true })); }catch(e){}
+return { ok:true, kind:'native', before: before, value: el.value, text: String(found.text).replace(/\\s+/g,' ').trim() };
+`;
+}
+
+module.exports = { observeScript, resolveScript, settleScript, findScript, nativeSelectScript };

@@ -674,4 +674,209 @@ async function drag(opts) {
   });
 }
 
-module.exports = { observe, click, type, find, scroll, drag, INPUT_KIND };
+// ---------------------------------------------------------------- select
+/*
+ * 下拉选择。两种下拉统一成一个动作:
+ *   原生 <select>           -> 页面脚本设 value + 派发 change(快, 但非受信点击, input_kind=synthetic)
+ *   自定义下拉(div 模拟)     -> 点开触发器 -> 重新 observe -> find 选项文本 -> 点选项(真输入 trusted)
+ * 参数: ref + value(原生, 匹配 option 的 value 或文本) 或 option_text(自定义, 匹配显示文本)
+ */
+async function select(opts) {
+  const o = opts || {};
+  if (!o.ref) {
+    const e = new Error("act/select 需要 ref(先调 act/observe 取)");
+    e.status = 400;
+    throw e;
+  }
+  const want = o.value != null ? String(o.value) : (o.option_text != null ? String(o.option_text) : null);
+  if (want == null) {
+    const e = new Error("act/select 需要 value(原生 select) 或 option_text(自定义下拉)");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+
+  const r0 = await resolveTarget(o.tabId, o.ref, wantTokOf(o.ref, o.page_token), o.quiet_ms);
+  const res = r0.res;
+  const tabId = r0.tabId;
+  if (res.stale) {
+    log("action", `select rejected: ${res.stale} ref=${o.ref}`);
+    return receipt({
+      stale: res.stale,
+      stale_reason: res.why,
+      target: { ref: o.ref },
+      dispatched: false,
+      hit: res.hit,
+      retryable: res.stale === "REF_NOT_PRESENTED" || res.stale === "NOT_VISIBLE" || res.stale === "OBSCURED",
+      note: "派发前门禁拒绝, 浏览器未收到任何输入。",
+    });
+  }
+  const target = res.target;
+
+  // --- 原生 <select>: 快速路径(JS 设值) ---
+  if (target.tag === "select") {
+    const { out } = await evalInPage(tabId, probe.nativeSelectScript(o.ref, want), 20000);
+    if (!out || out.ok !== true) {
+      const why = (out && out.why) || "unknown";
+      log("action", `select native rejected: ${why} ref=${o.ref}`);
+      return receipt({
+        target,
+        dispatched: false,
+        mechanism: "select",
+        effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+        retryable: why === "option_not_found",
+        note: why === "option_not_found"
+          ? `原生下拉里没有匹配 "${want}" 的选项。可用: ${JSON.stringify((out && out.available) || [])}`
+          : `原生 <select> 设值失败: ${why}`,
+      });
+    }
+    const s = await settle(tabId, o.ref, res, o.expect, o.settle_ms);
+    const verdict = verdictOf(s, res.quiet);
+    return receipt({
+      target,
+      input_kind: "synthetic",
+      dispatched: true,
+      mechanism: "select",
+      hit: target.hit,
+      effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+      postcondition: postconditionOf(s, o.expect),
+      retryable: verdict === "none",
+      note: `原生 <select> 用 JS 设值 + change 事件(非受信, input_kind=synthetic)。值 ${out.before} -> ${out.value} ("${out.text}")`,
+    });
+  }
+
+  // --- 自定义下拉: 点开 -> 观察 -> 找选项 -> 点选项 ---
+  const d0 = await dispatchClick(tabId, target, o);
+  if (d0.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: d0.dispatched,
+      mechanism: "select",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d0.dispatched === false,
+      note: d0.dispatched === "unknown"
+        ? "点开下拉超时, 结果未知; 请重新 observe 看下拉是否已展开。"
+        : "点开下拉失败: " + (d0.error || "unknown"),
+    });
+  }
+  if (d0.withheld) {
+    return receipt({
+      target,
+      input_kind: d0.trusted ? "trusted" : "synthetic",
+      dispatched: true,
+      mechanism: "select",
+      hit: target.hit,
+      withheld: true,
+      swapped: { before: d0.target_before, after: d0.target_after },
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: true,
+      note: "点开下拉被扣发(按下后目标变了), 下拉未展开。",
+    });
+  }
+
+  // 重新 observe 拿下拉展开后的选项(它们是新出现的元素)
+  const ob = await observe({ tabId, max: OBSERVE_MAX, timeout_ms: o.timeout_ms });
+
+  // 找选项: 按显示文本精确匹配, 排除触发器自己(它可能正显示着同一段文本)
+  const f = await find({ tabId, filters: [{ field: "text", value: want, op: "equals" }], max: 100, timeout_ms: o.timeout_ms });
+  const opt = (f.matches || []).filter((m) => m.ref !== o.ref)[0];
+  if (!opt || opt.cx == null || opt.cy == null) {
+    const cands = (f.matches || []).map((m) => m.name).filter(Boolean).slice(0, 20);
+    log("action", `select option not found: want=${want} candidates=${cands.join("|")}`);
+    return receipt({
+      target,
+      input_kind: d0.trusted ? "trusted" : "synthetic",
+      dispatched: true,
+      mechanism: "select",
+      hit: target.hit,
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: true,
+      note: `已点开下拉, 但没找到选项文本 "${want}"。候选项: ${cands.join(", ") || "(空)"}`,
+    });
+  }
+
+  const d1 = await dispatchClick(tabId, { cx: opt.cx, cy: opt.cy }, o);
+  if (d1.dispatched !== true) {
+    return receipt({
+      target,
+      dispatched: d1.dispatched,
+      mechanism: "select",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d1.dispatched === false,
+      note: d1.dispatched === "unknown"
+        ? "点选项超时, 结果未知; 请重新 observe 看选项是否已选中。"
+        : "点选项失败: " + (d1.error || "unknown"),
+    });
+  }
+
+  const s = await settle(tabId, o.ref, res, o.expect, o.settle_ms);
+  const verdict = verdictOf(s, res.quiet);
+  return receipt({
+    target,
+    input_kind: d1.trusted ? "trusted" : "synthetic",
+    dispatched: true,
+    mechanism: "select",
+    hit: target.hit,
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, o.expect),
+    retryable: verdict === "none",
+    note: `自定义下拉: 点开触发器 -> 定位选项 -> 点击选项 "${opt.name}"`,
+  });
+}
+
+// ---------------------------------------------------------------- run
+/*
+ * 多步编排: 一个任务 = 动作序列。逐步执行, 每步独立回执。
+ * 默认 fail-fast(任一步失败即停), continueOnError 则继续跑完。
+ * 每步可继承 run 级 tabId/page_token, 也可单步覆盖。
+ */
+const RUNNERS = { observe, find, click, type, select, scroll, drag };
+
+async function run(opts) {
+  const o = opts || {};
+  if (!Array.isArray(o.steps) || o.steps.length === 0) {
+    const e = new Error("act/run 需要 steps 数组(每项含 action)");
+    e.status = 400;
+    throw e;
+  }
+  const results = [];
+  let failedAt = null;
+  for (let i = 0; i < o.steps.length; i++) {
+    const step = o.steps[i] || {};
+    const fn = RUNNERS[step.action];
+    if (!fn) {
+      failedAt = i;
+      results.push({ index: i, action: step.action || null, ok: false, error: "未知动作: " + (step.action || "(空)") });
+      break;
+    }
+    try {
+      const args = Object.assign({}, step, {
+        tabId: step.tabId != null ? step.tabId : o.tabId,
+        page_token: step.page_token != null ? step.page_token : o.page_token,
+      });
+      delete args.action;
+      const r = await fn(args);
+      // 硬失败口径: 门禁拒绝(stale) / 派发失败或未知(dispatched=false|"unknown") / 显式 ok:false
+      const ok = !!(r && r.ok !== false && !r.stale && r.dispatched !== false && r.dispatched !== "unknown");
+      results.push({ index: i, action: step.action, ok, receipt: r });
+      if (!ok) {
+        failedAt = i;
+        if (!o.continueOnError) break;
+      }
+    } catch (e) {
+      failedAt = i;
+      results.push({ index: i, action: step.action, ok: false, error: String((e && e.message) || e) });
+      if (!o.continueOnError) break;
+    }
+  }
+  return {
+    ok: failedAt == null,
+    total: o.steps.length,
+    done: results.length,
+    failed_at: failedAt,
+    continue_on_error: !!o.continueOnError,
+    steps: results,
+  };
+}
+
+module.exports = { observe, click, type, find, scroll, drag, select, run, INPUT_KIND };

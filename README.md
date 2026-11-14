@@ -203,6 +203,8 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | `browser_find` | `POST /api/v1/act/find` | 可信动作层：按 label/placeholder/name/id/text 等语义字段查找已观察元素，返回 ref |
 | `browser_scroll` | `POST /api/v1/act/scroll` | 可信动作层：滚动页面（direction+amount）或滚动到某 ref（CDP 真输入） |
 | `browser_drag` | `POST /api/v1/act/drag` | 可信动作层：拖拽 from→to（ref 或坐标），两端点过门禁，返回 ActionReceipt |
+| `browser_select` | `POST /api/v1/act/select` | 可信动作层：下拉选择（原生 select JS 设值 / 自定义下拉点开→找选项→点选项） |
+| `browser_run` | `POST /api/v1/act/run` | 可信动作层：多步动作编排（steps 序列执行，每步独立回执，fail-fast/continueOnError） |
 
 列表参数（site/intitle/inurl/intext/exclude/or）传数组（`["a.com","b.com"]`）或逗号分隔字符串均可；默认参数三层合并逻辑与 REST 完全一致（请求 > 设置页默认 > 内置）。
 
@@ -238,6 +240,8 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | POST | `/api/v1/act/find` | **可信动作层**：按语义字段（label/placeholder/name/id/text/role/tag/type）查找已观察元素，返回匹配 ref 列表 |
 | POST | `/api/v1/act/scroll` | **可信动作层**：滚动页面（direction+amount）或滚动到某 ref（CDP mouseWheel 真输入） |
 | POST | `/api/v1/act/drag` | **可信动作层**：拖拽 from→to（ref 或 to_x/to_y 坐标），两端点过门禁，返回 ActionReceipt |
+| POST | `/api/v1/act/select` | **可信动作层**：下拉选择（原生 select JS 设值 / 自定义下拉点开→observe→find→点选项），返回 ActionReceipt |
+| POST | `/api/v1/act/run` | **可信动作层**：多步动作编排（steps 序列，每步独立回执，默认 fail-fast、可 continueOnError） |
 
 > 示例接口 `scnet/free-credit`、`scnet/token-plan`、`search/baidu`、`search/google` 只是「用浏览器能力封装一个 Web API」的样板。新增任何 Web 能力（如页面正文提取、表单自动化）都走同一套机制，成熟后会作为预置端点陆续加入。
 

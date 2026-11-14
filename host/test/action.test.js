@@ -45,6 +45,7 @@ function mock(impl) {
     const code = args.code || "";
     if (code.indexOf("var LIMIT =") >= 0) return page(impl.settle ? impl.settle() : { verdict: "none", checks: [] });
     if (code.indexOf("var FILTERS =") >= 0) return page(impl.find ? impl.find() : {});
+    if (code.indexOf("var VALUE =") >= 0) return page(impl.nativeSelect ? impl.nativeSelect() : { ok: true, kind: "native", before: "a", value: "b", text: "B" });
     if (code.indexOf("var REF =") >= 0) return page(impl.resolve ? impl.resolve() : {});
     if (code.indexOf("var SEL =") >= 0) return page(impl.observe ? impl.observe() : {});
     throw new Error("unrecognized injected script");
@@ -368,4 +369,123 @@ test("drag: 缺少 from 或 to -> 400", async () => {
   await assert.rejects(() => action.drag({ from: "p1a.r3" }), (e) => e.status === 400);
   await assert.rejects(() => action.drag({}), (e) => e.status === 400);
   assert.strictEqual(calls.length, 0);
+});
+
+// ------------------------------------------------------------- select
+function resolveTag(tag) {
+  return Object.assign(resolveOk(), {
+    target: { ref: "p1a.r3", tag: tag, role: tag === "select" ? "combobox" : "button", name: "选择", cx: 420, cy: 310, hit: "self", in_view: true, rect: { x: 400, y: 295 } },
+  });
+}
+
+test("select(原生): JS 设值走 synthetic, 不点鼠标", async () => {
+  mock({
+    resolve: () => resolveTag("select"),
+    nativeSelect: () => ({ ok: true, kind: "native", before: "a", value: "b", text: "选项B" }),
+    settle: () => CHANGED,
+  });
+  const r = await action.select({ ref: "p1a.r3", value: "b" });
+  assert.strictEqual(r.dispatched, true);
+  assert.strictEqual(r.mechanism, "select");
+  assert.strictEqual(r.input_kind, "synthetic", "原生 select 是 JS 设值, 非受信点击");
+  assert.strictEqual(r.effect.verdict, "changed");
+  assert.strictEqual(CALLS_TO_TOOL("chrome_computer"), 0, "原生 select 不派发鼠标事件");
+});
+
+test("select(原生): 选项不存在 -> 拒绝并列出可用项", async () => {
+  mock({
+    resolve: () => resolveTag("select"),
+    nativeSelect: () => ({ ok: false, why: "option_not_found", available: [{ value: "x", text: "甲" }, { value: "y", text: "乙" }] }),
+  });
+  const r = await action.select({ ref: "p1a.r3", value: "不存在" });
+  assert.strictEqual(r.dispatched, false);
+  assert.strictEqual(r.retryable, true);
+  assert.match(r.note, /可用/);
+});
+
+test("select(自定义): 点开->找选项->点选项, 真输入 trusted", async () => {
+  mock({
+    resolve: () => resolveTag("div"),
+    observe: () => ({ tok: "p1a.r", state: { path: "/form" }, scanned: 5, shown: 5, truncated: false, elements: [] }),
+    find: () => ({ tok: "p1a.r", count: 1, truncated: false, matches: [{ ref: "p1a.r9", tag: "li", role: "option", name: "上海市", cx: 400, cy: 500 }] }),
+    settle: () => CHANGED,
+  });
+  const r = await action.select({ ref: "p1a.r3", option_text: "上海市" });
+  assert.strictEqual(r.dispatched, true);
+  assert.strictEqual(r.mechanism, "select");
+  assert.strictEqual(r.input_kind, "trusted", "点选项走 CDP 真输入");
+  const cpu = calls.filter((c) => c.name === "chrome_computer");
+  assert.strictEqual(cpu.length, 2, "点开触发器 + 点选项");
+  assert.strictEqual(cpu[0].args.action, "left_click");
+  assert.deepStrictEqual(cpu[1].args.coordinates, { x: 400, y: 500 });
+});
+
+test("select: 缺少 value/option_text -> 400", async () => {
+  mock({});
+  await assert.rejects(() => action.select({ ref: "p1a.r3" }), (e) => e.status === 400);
+  assert.strictEqual(calls.length, 0);
+});
+
+// ------------------------------------------------------------- run
+test("run: 多步顺序执行, 全成功 ok=true done=全部", async () => {
+  mock({ resolve: () => resolveOk(), settle: () => CHANGED });
+  const r = await action.run({
+    steps: [
+      { action: "scroll", direction: "down", amount: 2 },
+      { action: "click", ref: "p1a.r3" },
+    ],
+  });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.total, 2);
+  assert.strictEqual(r.done, 2);
+  assert.strictEqual(r.failed_at, null);
+  assert.strictEqual(r.steps[0].ok, true);
+  assert.strictEqual(r.steps[1].ok, true);
+});
+
+test("run: fail-fast 第一步失败即停", async () => {
+  mock({ resolve: () => ({ stale: "REF_NOT_PRESENTED", tok: "p1a.r", why: "不在观察集合" }) });
+  const r = await action.run({
+    steps: [
+      { action: "click", ref: "p1a.r999" },
+      { action: "scroll", direction: "down", amount: 2 },
+    ],
+  });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.done, 1);
+  assert.strictEqual(r.failed_at, 0);
+});
+
+test("run: continueOnError 继续跑完", async () => {
+  let resolveN = 0;
+  mock({
+    resolve: () => (++resolveN === 1 ? { stale: "REF_NOT_PRESENTED", tok: "p1a.r", why: "不在观察集合" } : resolveOk()),
+    settle: () => CHANGED,
+  });
+  const r = await action.run({
+    continueOnError: true,
+    steps: [
+      { action: "click", ref: "p1a.r999" },
+      { action: "click", ref: "p1a.r3" },
+    ],
+  });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.done, 2);
+  assert.strictEqual(r.failed_at, 0);
+  assert.strictEqual(r.steps[0].ok, false);
+  assert.strictEqual(r.steps[1].ok, true);
+});
+
+test("run: 未知动作 -> 立即失败并报错", async () => {
+  mock({});
+  const r = await action.run({ steps: [{ action: "nope" }] });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.failed_at, 0);
+  assert.match(r.steps[0].error, /未知动作/);
+  assert.strictEqual(calls.length, 0);
+});
+
+test("run: 缺少 steps -> 400", async () => {
+  mock({});
+  await assert.rejects(() => action.run({}), (e) => e.status === 400);
 });
