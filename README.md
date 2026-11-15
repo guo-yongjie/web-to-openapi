@@ -4,12 +4,12 @@
 >
 > 本仓库在原作者基础上，新增了**可信动作层（Trusted Action Layer）+ 真实输入（CDP real input）**：
 >
-> - **8 个可信动作**：`observe` / `find` / `click` / `type` / `scroll` / `drag` / `select` / `run`，全部带回执（ActionReceipt），可验证「这一步到底做没做成」；
-> - **真实输入**：点击、键入、滚动、拖拽均走 CDP（`Input.dispatchMouseEvent` 等），产生 `isTrusted=true` 的事件，而非内容脚本合成事件，能通过目标页面的可信度校验；
+> - **9 个可信动作**：`observe` / `find` / `click` / `type` / `scroll` / `drag` / `select` / `upload` / `run`，全部带回执（ActionReceipt），可验证「这一步到底做没做成」；
+> - **真实输入**：点击、键入、滚动、拖拽均走 CDP（`Input.dispatchMouseEvent` 等），产生 `isTrusted=true` 的事件，而非内容脚本合成事件，能通过目标页面的可信度校验；文件上传走 CDP `DOM.setFileInputFiles`；
 > - **语义定位 + 门禁**：`observe → find`（按 label/placeholder/name/id）拿 ref，再用 ref 操作，拒绝「凭记忆编元素」的幻觉；`run` 支持多步编排（fail-fast / continueOnError）；
-> - **真机验收过**：在真实页面逐项验证了 trusted 输入与回执，配套 mock 测试 80+ 例。
+> - **真机验收过**：在真实页面逐项验证了 trusted 输入与回执，配套 mock 测试 90+ 例。
 >
-> 动作层入口：REST `POST /api/v1/act/*`；MCP 工具 `browser_observe/find/click/type/scroll/drag/select/run`。详见 `docs/写操作契约.md`。
+> 动作层入口：REST `POST /api/v1/act/*`；MCP 工具 `browser_observe/find/click/type/scroll/drag/select/upload/run`。详见 `docs/写操作契约.md`。
 
 > **支持 Edge 与 Chrome（及其它 Chromium 内核浏览器）**。文中出现「Edge」的地方均可替换为 Chrome，二者用法完全一致——安装包里只有一份扩展，两个浏览器都能加载。
 
@@ -48,7 +48,7 @@ openapi-host.js ── lib/(基础设施) ── sites/(一个网页一个文件
 | `extension/` | 独立浏览器扩展（**Edge / Chrome 通用**；从 `chrome-mcp-server-1.0.0` 复制改造：新密钥/新 ID、宿主名改为 `com.webtoopenapi.host`、品牌重命名为 Web To OpenAPI、内置 Options 设置页） |
 | `host/openapi-host.js` | **启动入口（薄）**：装配站点注册表 → native messaging → HTTP 服务 |
 | `host/lib/` | 基础设施：`config` 配置 / `log` 日志 / `nm` native messaging 命令通道 / `util` 浏览器操作（开页·执行 JS·重试提取·链接还原）/ `defaults` 默认参数三层合并 / `registry` 站点注册表 / `mcp` MCP 协议 / `spec` `/openapi.json` / `docs` `/docs` 文档页 / `tools` 浏览器工具目录 / `http` 路由分发 |
-| `host/sites/` | **一个网页一个文件**：`scnet.js` / `baidu.js` / `google.js` / `translate.js`（在线翻译，内部用引擎表聚合多站点）/ `ysbang.js`（药师帮，字体反爬 + 页面挂钩）/ `qshtyy.js`（海豚药药，站内 JSON 接口直连 + 批量 + 跨平台比价）+ 服务自身的 `_service.js`。新增能力只在这里加文件，见「新增一个网页」 |
+| `host/sites/` | **一个网页一个文件**：`scnet.js` / `baidu.js` / `google.js` / `translate.js`（在线翻译，内部用引擎表聚合多站点）/ `ysbang.js`（药师帮，字体反爬 + 页面挂钩）/ `qshtyy.js`（海豚药药，站内 JSON 接口直连 + 批量 + 跨平台比价）/ `taobao.js`（淘宝搜同款，上传本地图 → 同款商品列表）+ 服务自身的 `_service.js`。新增能力只在这里加文件，见「新增一个网页」 |
 | `host/mcp-stdio.js` | MCP stdio 桥接入口（独立进程，零依赖）：把 MCP 客户端的按行 JSON-RPC 转发到 `/mcp`，供 Claude Desktop 类客户端以 command 方式接入 |
 | `host/config.json` | **默认**监听地址/端口（`host` / `port` / `tool_timeout_ms`）——仅当「插件设置」未配置时生效 |
 | `host/run_host.bat` | 浏览器拉起 host 的启动器（自动找 node.exe；Edge / Chrome 走同一个） |
@@ -215,7 +215,11 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | `browser_scroll` | `POST /api/v1/act/scroll` | 可信动作层：滚动页面（direction+amount）或滚动到某 ref（CDP 真输入） |
 | `browser_drag` | `POST /api/v1/act/drag` | 可信动作层：拖拽 from→to（ref 或坐标），两端点过门禁，返回 ActionReceipt |
 | `browser_select` | `POST /api/v1/act/select` | 可信动作层：下拉选择（原生 select JS 设值 / 自定义下拉点开→找选项→点选项） |
+| `browser_upload` | `POST /api/v1/act/upload` | 可信动作层：给 `<input type=file>` 上传本地文件（CDP DOM.setFileInputFiles） |
 | `browser_run` | `POST /api/v1/act/run` | 可信动作层：多步动作编排（steps 序列执行，每步独立回执，fail-fast/continueOnError） |
+| `taobao_search_by_image` | `POST /api/v1/taobao/search-by-image` | 淘宝搜同款：上传本地图 → 同款商品列表（JSON + xlsx） |
+| `jd_search_by_image` | `POST /api/v1/jd/search-by-image` | 京东搜同款：上传本地图 → 同款商品列表（JSON + xlsx） |
+| `ali1688_search_by_image` | `POST /api/v1/ali1688/search-by-image` | 1688 以图搜款：上传本地图 → 同款货源列表（JSON + xlsx） |
 
 列表参数（site/intitle/inurl/intext/exclude/or）传数组（`["a.com","b.com"]`）或逗号分隔字符串均可；默认参数三层合并逻辑与 REST 完全一致（请求 > 设置页默认 > 内置）。
 
@@ -252,7 +256,11 @@ curl http://127.0.0.1:8090/api/v1/scnet/balance        # 聚合: 两项一起查
 | POST | `/api/v1/act/scroll` | **可信动作层**：滚动页面（direction+amount）或滚动到某 ref（CDP mouseWheel 真输入） |
 | POST | `/api/v1/act/drag` | **可信动作层**：拖拽 from→to（ref 或 to_x/to_y 坐标），两端点过门禁，返回 ActionReceipt |
 | POST | `/api/v1/act/select` | **可信动作层**：下拉选择（原生 select JS 设值 / 自定义下拉点开→observe→find→点选项），返回 ActionReceipt |
+| POST | `/api/v1/act/upload` | **可信动作层**：给 `<input type=file>` 上传本地文件（CDP DOM.setFileInputFiles），返回 ActionReceipt |
 | POST | `/api/v1/act/run` | **可信动作层**：多步动作编排（steps 序列，每步独立回执，默认 fail-fast、可 continueOnError） |
+| GET\|POST | `/api/v1/taobao/search-by-image` | **淘宝搜同款**：给本地商品图，找同款/相似商品列表（标题/价格/店铺/销量/链接），返回 JSON + 落 xlsx |
+| GET\|POST | `/api/v1/jd/search-by-image` | **京东搜同款**：给本地商品图，找同款/相似商品列表（标题/价格/销量/好评/店铺/链接），返回 JSON + 落 xlsx |
+| GET\|POST | `/api/v1/ali1688/search-by-image` | **1688 以图搜款**：给本地商品图，找同款/相似货源列表（标题/价格/销量/起订量/店铺/链接），返回 JSON + 落 xlsx |
 
 > 示例接口 `scnet/free-credit`、`scnet/token-plan`、`search/baidu`、`search/google` 只是「用浏览器能力封装一个 Web API」的样板。新增任何 Web 能力（如页面正文提取、表单自动化）都走同一套机制，成熟后会作为预置端点陆续加入。
 

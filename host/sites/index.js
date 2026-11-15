@@ -22,6 +22,9 @@ const sites = [
   require("./translate"), // 在线翻译: 统一入口 + 引擎表(加引擎只改 translate.js 里的 ENGINES)
   require("./ysbang"), // 药师帮批发报价: 自动翻页 + 字体连字解码(解码脚本在 ysbang-decode.js)
   require("./qshtyy"), // 海豚药药(兰州强生): 站内 JSON 接口直连 + 批量 + 跨平台比价
+  require("./taobao"), // 淘宝搜同款(以图搜图): 上传本地图片 -> 同款商品列表(JSON + xlsx)
+  require("./jd"), // 京东搜同款(以图搜图): 上传本地图片 -> 同款商品列表(JSON + xlsx)
+  require("./ali1688"), // 1688 以图搜款(以图搜货): 上传本地图片 -> 同款货源列表(JSON + xlsx)
 ];
 
 for (const s of sites) registry.register(s);

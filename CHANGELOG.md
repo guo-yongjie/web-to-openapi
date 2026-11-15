@@ -7,6 +7,51 @@
 
 ---
 
+## [1.13.0] - 2026-11-15
+
+**新增 1688 以图搜款站点（`sites/ali1688.js`）。** 与淘宝拍立淘、京东搜同款同款能力，覆盖阿里系 B2B 批发平台。MINOR：只加站点与新端点，不改任何既有端点行为。
+
+- **`ali1688_search_by_image`（`GET|POST /api/v1/ali1688/search-by-image`）**：给一张本地商品图，找到 1688 同款/相似货源列表（标题/价格/销量/起订量/店铺/链接），返回 JSON + 落 xlsx。链路：进 `www.1688.com` 首页 → 定位搜索框内「以图搜款」按钮（内含透明 `<input type=file>`）→ 上传本地图（CDP `DOM.setFileInputFiles`）→ 弹「以图搜款」面板（显示「已上传N张图」+ 预览）→ 点面板「搜索」按钮 → 结果在**新标签页**打开（`air.1688.com/kapp/1688-search/pc-image-search`）→ 抓 `div[class*=searchOfferWrapper]` 货源列表。复用浏览器登录态，遇登录/验证码走 `needsHuman` 切前台。
+- 参数对齐淘宝/京东搜同款：`image_path`（必填）/ `tabId`（复用已开 1688 页）/ `wait_ms`（默认 25000）/ `max_items`（默认 60，第一页约 60 条）/ `out`（xlsx 路径）/ `no_excel`。
+- **扩展侧零改动**（复用既有 `chrome_upload_file` / `chrome_computer` / `chrome_navigate` / `chrome_switch_tab` / `get_windows_and_tabs`），`manifest.json` 版本不动。
+- ✅ **真机联调完成（2026-11-15）**：用海氏海诺腕关节固定器主图跑通端到端——上传→面板确认→点搜索→抓取，一次拿到 60 条货源（识别为「腕关节固定器 运动护具用品」类目，标题/价格/销量/起订量/店铺全部正确，价格含小数如 ¥5.61、¥0.87）。校准出 1688 与淘宝/京东的关键差异：①上传入口不是「先点相机再传」，而是**透明 file input 直接覆盖在「以图搜款」按钮上**（`div[class*=imageSearchBtn]` 内，class 含 `overlay--hash`，display:block 约 144x56），首页唯一文件框，直接 `input[type=file]` 直传零歧义；②上传后弹「以图搜款」面板（`div[class*=imageSearchPopover]`），`span[class*=count]` 显示「已上传N张图」，底部 `button[class*=action]`（文本「搜索」）才是触发搜索的二次确认；③点搜索后是**新开标签页**跳转（非当前页跳转、非 SPA），须轮询 `get_windows_and_tabs` 按 URL 特征 `pc-image-search` 抓新标签再提取；④结果卡片 `div[class*=searchOfferWrapper]`，**offerId 不在 href**（卡片无商品 `<a>`），藏在 `span[data-extra]` 的 JSON `{"offerId":733028524461}`，链接 host 侧拼 `detail.1688.com/offer/{offerId}.html`（不回传 URL 避开 query-string sanitize）；⑤销量「5.1万+件」与起订量「3件起批」须用「件(?!起)」负向前瞻区分，否则「1件起批」会被误读成销量；⑥价格分三块渲染（¥/整数/小数），取 `priceItem` 的 innerText 拼回。
+- **已知限制**：当前只抓第一页（约 60 条）；1688 图片搜索与淘宝/京东同类，连续猛刷可能触发限流（点搜索不开结果标签，对策同前：复用已登录标签、控频、限流后暂停再试）。
+
+---
+
+## [1.12.0] - 2026-11-15
+
+**新增京东搜同款站点（`sites/jd.js`）。** 与淘宝搜同款同款能力，覆盖另一大电商平台。MINOR：只加站点与新端点，不改任何既有端点行为。
+
+- **`jd_search_by_image`（`GET|POST /api/v1/jd/search-by-image`）**：给一张本地商品图，找到京东同款/相似商品列表（标题/价格/销量/好评/店铺/链接），返回 JSON + 落 xlsx。链路：进 `www.jd.com` 首页 → 点搜索框内「图片搜索(搜同款)」相机按钮 → 弹上传面板 → 上传本地图（CDP `DOM.setFileInputFiles`）→ 点面板「搜索」按钮二次确认 → 等结果页 `search.jd.com/image` → 抓 `[data-sku]` 商品列表。复用浏览器登录态，遇登录/验证码走 `needsHuman` 切前台。
+- 参数对齐淘宝搜同款：`image_path`（必填）/ `tabId`（复用已开京东页）/ `wait_ms`（默认 25000）/ `max_items`（默认 60）/ `out`（xlsx 路径）/ `no_excel`。
+- **扩展侧零改动**（复用既有 `chrome_upload_file` / `chrome_computer` / `chrome_navigate` / `chrome_switch_tab`），`manifest.json` 版本不动。
+- ✅ **真机联调完成（2026-11-15）**：用血糖仪白底主图跑通端到端——点相机→上传→点搜索→抓取，一次拿到 30 条同款（识别为血糖仪/血糖试纸类目，以鱼跃 550/560 为主，价格/销量/好评/店铺全部正确，价格含小数如 ¥55.44）。校准出京东与淘宝的关键差异：①相机按钮是无 role/文本的 div（`.jd_pc_search_bar_react_image_search_button`），observe 的 known-set 拿不到 ref，须 JS 定位坐标 + `chrome_computer` 真点击；②文件框 id 固定 `#searchImgInput`（display:none，但 `fileInputsScript` 会枚举隐藏框，这里直接用 selector 直传零歧义）；③结果页商品用 `[data-sku]`，链接固定 `item.jd.com/{sku}.html`，不用在页面回传 URL（避开 query-string sanitize）；④窗口至少 1600 宽——上传面板「搜索」按钮实测在 x≈1149-1356，默认 1280 宽会把它顶出视口导致坐标点击失效；⑤京东首页 `readyState` 可能长期停在 `interactive`（持续异步加载），等相机按钮只能看元素是否出现，不能卡 `ready==="complete"`；⑥点搜索后是**整页跳转**（非淘宝 SPA），跳转中 body 短暂清空，`bodyLen===0` 的 504 判断必须放到超时后而非循环内；⑦**上传面板按钮文本双态**——初始是「上传图片」、塞文件后 change 事件把它变成「搜索」，批量复用标签时 change 偶发不被 React 处理、按钮停留在「上传图片」，此时点它会触发原生 file input 的**系统文件选择框**（批量跑挂的根因），故上传后必须轮询校验按钮文本已是「搜索」（不是则手动补发 `change` 事件兜底）再点击。
+- **已知限制**：当前只抓第一页（约 30 条）；京东图片搜索与淘宝拍立淘同类，连续猛刷可能触发限流（点搜索不跳结果页，对策同淘宝：复用已登录标签、控频、限流后暂停再试）。
+
+---
+
+## [1.11.0] - 2026-11-14
+
+**动作层补上「填表格」最后一块：文件上传；新增淘宝搜同款站点。**
+
+- **`act/upload`（`browser_upload`）**：给 `<input type=file>` 塞本地文件，走 CDP `DOM.setFileInputFiles`（与点击/键入不是一条路，对应写操作契约「已知坑 #5」）。定位：传 `ref`（来自 observe/find）则校验并取 selector；不传 ref 则自动枚举文件输入框——0 个报错（`hint=no_file_input`，提示可能要先点上传按钮）、1 个直接用、多个返回候选（`hint=multiple_file_inputs`）要求显式传 ref。返回标准 ActionReceipt。`browser_run` 的 `action` 枚举同步加入 `upload`。
+- **`probe.js`** 新增 `w2oCss`（元素→稳定 CSS 选择器，供 `chrome_upload_file` 的 selector 参数用）、`fileInputsScript`（枚举所有 `input[type=file]`，含隐藏的）、`fileInputResolveScript`（校验 ref 是文件框，不查可见性——文件框常 display:none）。
+- **`lib/xlsx.js`**：零依赖最小 xlsx 写入器（STORE zip + CRC32 + SpreadsheetML 内联字符串），Excel/WPS 直接打开，供站点落「比价清单」类表格。
+- **`sites/taobao.js`（淘宝搜同款）**：`POST /api/v1/taobao/search-by-image` + MCP `taobao_search_by_image`。链路：进 s.taobao.com 搜索页（有「搜同款/按图片搜索/上传图片」明入口）→ 定位文件框上传本地图 → 点「搜索」按钮触发拍立淘（二次确认）→ 等结果页 → 抓商品列表（标题/价格/店铺/销量/链接）→ 返回 JSON + 落 xlsx。复用浏览器登录态，遇登录/验证码走 `needsHuman` 切前台。
+- 扩展侧**零改动**（上传复用既有 `chrome_upload_file`）。
+- ✅ **真机联调完成（2026-11-14）**：用真实商品图（海氏海诺腕关节固定器）跑通端到端——上传→点搜索→抓取，一次拿到 20 条同款（标题/价格/店铺/销量/链接全部正确）。校准出 3 个关键点：①结果页 URL 是 `s.taobao.com/?localImgKey=...` 不是 `/search`；②上传后要再点 `#image-search-upload-button` 才触发搜索；③商品卡片是 `div[class*=doubleCard]`（链接在卡片外层，用 `closest('a')` 取），标题从 `div[class*=mainPicAndDesc]` 取（img 无 alt），价格数字被空格拆分（`¥ 18 .71`），销量有 `29人付款/100+人付款/1万+人付款` 多种格式。
+- ⚠ **风控限制（真机实测）**：拍立淘对「程序化塞文件 + 冷启动标签」有反自动化限制，高频调用触发限流（首次能搜几十条，连续多次后点搜索不返回、不跳转）。对策：优先复用已打开已登录的淘宝标签、控制调用频率。属平台风控，非代码缺陷。
+- 🐞 **修复复用标签的两个 bug（真机批量询价发现）**：
+  1. 复用 `tabId` 时若该标签是上一轮结果页（URL 带 `localImgKey` 残留），直接 upload 会因页面不是干净首页而搜不出。`searchByImage` 现在复用标签时会先 navigate 到「不带 query 的首页」清掉残留——带 `?f=xxx` 只会追加参数、`localImgKey` 仍在，只有 navigate 到 `https://s.taobao.com/` 才会真正回首页。
+  2. `clickImageSearch` 调 `chrome_switch_tab` 只传了 `tabId` 没传 `windowId`——而扩展侧只有在收到 `windowId` 时才 `chrome.windows.update(focused:true)` 把窗口真正带到前台，否则只 `tabs.update(active)`，窗口仍后台/被遮挡，Chromium 冻结渲染导致「点搜索不触发、结果不渲染」。已加 `windowIdOf()` 反查窗口 id 并传入，点搜索前真正激活窗口。
+- 🐞 **修复「上传两遍 / 浮层挂着」（用户实际使用反馈）**：
+  1. 「上传两遍」根因：固定 `sleep` 不可靠——新标签首次下载拍立淘 SDK 慢（网络慢时 10s 都不够），早于就绪时第一次 upload 判 `no_file_input`，代码走「点入口+二次上传」补一次，视觉上就是上传两遍。改为**轮询探测文件框就绪 + 额外等 2.5s 让 SDK 绑定 change**，取代固定 sleep。
+  2. 「浮层挂着」根因：「按图片搜索」浮层是常驻浮层，点搜索后不自动关，一直挂着像卡住。新增 `closeImagePanel()`，提取完结果后点浮层右上角 `back-button` 关掉。
+  - 实测：改为「不传 tabId、每张独立标签、执行完自动关闭」的方式批量跑 11 张，**11/11 全成功**（每张 7-9 秒，共 110 条），不再上传两遍、不再挂浮层。
+
+---
+
 ## [1.10.1] - 2026-11-14
 
 **合入上游 run_host.bat（launcher 重构 + 修双开自杀 bug）**：从上游 `dbf9737`/`c21380d`/`d2223b0` 取 `host/run_host.bat` 最终版。

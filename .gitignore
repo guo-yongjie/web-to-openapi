@@ -39,6 +39,8 @@ g*.json
 node_modules/
 .vscode/
 .idea/
+# WorkBuddy 项目数据（会话记忆/日志，含 token 等敏感信息，绝不上传公开仓）
+.workbuddy/
 .DS_Store
 Thumbs.db
 *.log

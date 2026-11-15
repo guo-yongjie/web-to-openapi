@@ -78,6 +78,7 @@ function receipt(parts) {
   if (parts.hit) r.hit = parts.hit;
   if (parts.withheld !== undefined) r.withheld = parts.withheld;
   if (parts.swapped) r.swapped = parts.swapped;
+  if (parts.hint) r.hint = parts.hint;
   if (parts.note) r.note = parts.note;
   return r;
 }
@@ -281,6 +282,27 @@ async function dispatchDrag(tabId, fromTarget, toTarget, opts) {
       return { dispatched: false, error: String(parsed.error || "drag failed").slice(0, 200) };
     }
     return { dispatched: true, raw: parsed };
+  } catch (e) {
+    if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
+    return { dispatched: false, error: e.message };
+  }
+}
+
+/*
+ * 上传文件: chrome_upload_file 走 CDP DOM.setFileInputFiles(见扩展 FileUploadTool),
+ * 与点击/键入不是一条路。参数 selector(必须是能定位到 <input type=file> 的 CSS 选择器)
+ * + filePath(本地绝对路径)。上传不需要前台标签(无鼠标事件), 不调用 activateTab。
+ */
+async function dispatchUpload(tabId, selector, filePath, opts) {
+  const o = opts || {};
+  try {
+    const data = await callTool("chrome_upload_file", { tabId, selector, filePath }, o.timeout_ms || 60000);
+    const text = dataText(data);
+    const parsed = safeParse(text);
+    if (parsed && parsed.success === true) {
+      return { dispatched: true, files: parsed.files || [], fileCount: parsed.fileCount || 0 };
+    }
+    return { dispatched: false, error: String(text || "upload failed").slice(0, 200) };
   } catch (e) {
     if (isTimeoutError(e)) return { dispatched: "unknown", error: e.message };
     return { dispatched: false, error: e.message };
@@ -824,13 +846,115 @@ async function select(opts) {
   });
 }
 
+// ---------------------------------------------------------------- upload
+/*
+ * 文件上传。给 <input type=file> 填文件(表单填写的最后一块, 与 type/select 不是一条路)。
+ * 定位: 传 ref(来自 observe/fileInputs) 则校验并取 selector; 不传则自动枚举文件输入框:
+ *   - 0 个 -> 报错(提示可能是点击入口后才出现 / 在 iframe 里)
+ *   - 1 个 -> 直接用
+ *   - 多个 -> 返回候选清单, 要求调用方显式传 ref 消歧
+ * 派发: chrome_upload_file(CDP DOM.setFileInputFiles)。返回 ActionReceipt, 字段同 click。
+ */
+async function upload(opts) {
+  const o = opts || {};
+  if (!o.file_path) {
+    const e = new Error("act/upload 需要 file_path(本地图片绝对路径)");
+    e.status = 400;
+    throw e;
+  }
+  const t0 = Date.now();
+  let tabId = o.tabId;
+  let selector = null;
+  let meta = null;
+
+  if (o.ref) {
+    const r0 = await evalInPage(o.tabId, probe.fileInputResolveScript(o.ref, wantTokOf(o.ref, o.page_token)), 20000);
+    tabId = r0.tabId;
+    const out = r0.out || {};
+    if (!out.ok) {
+      const STALE = { DOCUMENT_CHANGED: "DOCUMENT_CHANGED", REF_NOT_PRESENTED: "REF_NOT_PRESENTED", FRAME_DETACHED: "FRAME_DETACHED", no_token: "REF_NOT_PRESENTED" };
+      log("action", `upload rejected: ${out.why} ref=${o.ref}`);
+      return receipt({
+        stale: STALE[out.why] || null,
+        stale_reason: out.why,
+        target: { ref: o.ref },
+        dispatched: false,
+        retryable: out.why === "REF_NOT_PRESENTED",
+        note: out.why === "NOT_FILE_INPUT"
+          ? `该 ref 不是文件输入框(tag=${out.tag}, type=${out.type}); 请用 observe/find 或 fileInputs 定位到 <input type=file>` 
+          : out.why === "no_token"
+            ? "缺少 page_token/ref 前缀, 无法定位; 请先 observe 或 fileInputs 拿 ref"
+            : "派发前校验失败: " + out.why,
+      });
+    }
+    selector = out.selector;
+    meta = out;
+  } else {
+    const r0 = await evalInPage(o.tabId, probe.fileInputsScript(), 20000);
+    tabId = r0.tabId;
+    const out = r0.out || {};
+    const inputs = out.inputs || [];
+    if (inputs.length === 0) {
+      return receipt({
+        target: null,
+        dispatched: false,
+        retryable: true,
+        hint: "no_file_input",
+        note: "页面里没有找到 <input type=file>。可能原因: 上传入口要先点击才出现(可先 click 相机/上传按钮再 upload), 或文件框藏在 iframe / shadow DOM 里。",
+      });
+    }
+    if (inputs.length > 1) {
+      log("action", `upload ambiguous: ${inputs.length} file inputs`);
+      return receipt({
+        target: null,
+        dispatched: false,
+        retryable: true,
+        hint: "multiple_file_inputs",
+        note: `页面有 ${inputs.length} 个文件输入框, 无法自动确定目标; 请先调用 act/find 或 fileInputs 拿到 ref 再显式传 ref。候选: ${JSON.stringify(inputs.map((x) => ({ ref: x.ref, selector: x.selector, accept: x.accept })))}`,
+      });
+    }
+    meta = inputs[0];
+    selector = meta.selector;
+  }
+
+  const d = await dispatchUpload(tabId, selector, o.file_path, o);
+  if (d.dispatched !== true) {
+    return receipt({
+      target: meta ? { ref: meta.ref, selector } : null,
+      dispatched: d.dispatched,
+      mechanism: "upload",
+      effect: { verdict: "none", signals: [], elapsed_ms: Date.now() - t0 },
+      retryable: d.dispatched === false,
+      note: d.dispatched === "unknown"
+        ? "上传结果未知(超时): 文件可能已经塞进文件框并触发了上传, 重复调用有二次上传风险, 因此不重试。请先 observe 看页面是否已跳转。"
+        : "上传失败: " + (d.error || "unknown"),
+    });
+  }
+
+  // 取证: 用文件框 ref + 上传前的快照, 检测 URL 变化 / expect / mutation
+  const res = { before: (meta && meta.snap) || {}, base: (meta && meta.base) || null };
+  const s = await settle(tabId, meta && meta.ref, res, o.expect, o.settle_ms);
+  const verdict = verdictOf(s, 0);
+  return receipt({
+    target: meta ? { ref: meta.ref, selector, name: meta.name, accept: meta.accept } : null,
+    input_kind: "trusted",
+    dispatched: true,
+    mechanism: "upload",
+    hit: meta && meta.visible ? "self" : "hidden",
+    effect: { verdict, signals: effectFromSettle(s).signals, elapsed_ms: s.elapsed_ms || Date.now() - t0 },
+    postcondition: postconditionOf(s, o.expect),
+    retryable: verdict === "none",
+    note: `已通过 CDP DOM.setFileInputFiles 把 ${o.file_path} 塞进文件输入框(selector=${selector}), fileCount=${d.fileCount}。`,
+  });
+}
+
 // ---------------------------------------------------------------- run
 /*
  * 多步编排: 一个任务 = 动作序列。逐步执行, 每步独立回执。
  * 默认 fail-fast(任一步失败即停), continueOnError 则继续跑完。
  * 每步可继承 run 级 tabId/page_token, 也可单步覆盖。
  */
-const RUNNERS = { observe, find, click, type, select, scroll, drag };
+const RUNNERS = { observe, find, click, type, select, scroll, drag, upload };
 
 async function run(opts) {
   const o = opts || {};
@@ -879,4 +1003,4 @@ async function run(opts) {
   };
 }
 
-module.exports = { observe, click, type, find, scroll, drag, select, run, INPUT_KIND };
+module.exports = { observe, click, type, find, scroll, drag, select, upload, run, INPUT_KIND };

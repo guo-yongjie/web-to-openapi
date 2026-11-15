@@ -145,6 +145,31 @@ function w2oFind(ref){
   if(!el) return null;
   return el;
 }
+// 从元素生成稳定 CSS 选择器(给 chrome_upload_file 的 selector 参数用)。
+// 优先 #id(合法标识符), 否则沿父链拼 tag:nth-of-type(...)。不含任何需要转义的字符。
+function w2oCss(el){
+  if(el && el.id && /^[A-Za-z][A-Za-z0-9_:-]*$/.test(String(el.id))) return '#' + el.id;
+  var parts = [];
+  var cur = el;
+  var depth = 0;
+  while(cur && cur.nodeType === 1 && cur.tagName){
+    var tag = cur.tagName.toLowerCase();
+    if(tag === 'html') break;
+    var part = tag;
+    if(cur.id && /^[A-Za-z][A-Za-z0-9_:-]*$/.test(String(cur.id))){ parts.unshift('#' + cur.id); break; }
+    var p = cur.parentElement;
+    if(p){
+      var same = 0;
+      for(var s = cur.previousElementSibling; s; s = s.previousElementSibling){ if(s.tagName && s.tagName.toLowerCase() === tag) same++; }
+      if(same > 0) part += ':nth-of-type(' + (same + 1) + ')';
+    }
+    parts.unshift(part);
+    if(tag === 'body') break;
+    cur = p;
+    if(++depth > 20) break;
+  }
+  return parts.join(' > ');
+}
 `;
 
 /*
@@ -421,4 +446,64 @@ return { ok:true, kind:'native', before: before, value: el.value, text: String(f
 `;
 }
 
-module.exports = { observeScript, resolveScript, settleScript, findScript, nativeSelectScript };
+/*
+ * FILE INPUTS: 枚举页面里所有 <input type=file>(含隐藏的, 文件上传入口通常是 display:none)。
+ * 文件上传走的是 CDP DOM.setFileInputFiles, 和普通点击/键入不是一条路(见 docs/写操作契约.md 已知坑#5),
+ * 所以这里单独探测: 为每个文件输入框分配 ref(进 known-set)并算好 CSS selector, 供 action.upload 用。
+ */
+function fileInputsScript() {
+  return `${PRELUDE}${HELPERS}
+var all = [];
+try{ all = Array.prototype.slice.call(document.querySelectorAll('input[type=file]')); }catch(e){}
+var inputs = [];
+for(var i = 0; i < all.length; i++){
+  var el = all[i];
+  var ref = window.__w2o.byEl.get(el);
+  if(!ref){
+    ref = window.__w2o.tok + '.r' + (++window.__w2o.seq);
+    try{ window.__w2o.byEl.set(el, ref); }catch(e){}
+    try{ window.__w2o.refs[ref] = new WeakRef(el); }catch(e){}
+  }
+  inputs.push({
+    ref: ref,
+    selector: w2oCss(el),
+    visible: w2oVisible(el),
+    accept: el.getAttribute('accept') || null,
+    multiple: !!el.multiple,
+    name: el.getAttribute('name') || null,
+    id: el.id || null
+  });
+}
+return { tok: window.__w2o.tok, snap: w2oSnap(), count: inputs.length, inputs: inputs };
+`;
+}
+
+/*
+ * FILE INPUT RESOLVE: 校验指定 ref 是存活的文件输入框(不校验可见性——文件框常隐藏), 返回 selector。
+ * 与 resolveScript 的区别: 不做可见/遮挡/禁用门禁, 只查 token 匹配 + 在观察集合 + 元素存活 + 是文件框。
+ */
+function fileInputResolveScript(ref, wantTok) {
+  return `${PRELUDE}${HELPERS}
+var REF = ${JSON.stringify(String(ref || ""))};
+var WANT = ${JSON.stringify(String(wantTok || ""))};
+var curTok = window.__w2o.tok;
+if(!WANT) return { ok:false, why:'no_token', tok:curTok };
+if(curTok !== WANT) return { ok:false, why:'DOCUMENT_CHANGED', tok:curTok };
+if(!Object.prototype.hasOwnProperty.call(window.__w2o.refs, REF)) return { ok:false, why:'REF_NOT_PRESENTED', tok:curTok };
+var el = w2oFind(REF);
+if(!el) return { ok:false, why:'FRAME_DETACHED', tok:curTok };
+var tag = el.tagName.toLowerCase();
+var ty = (el.type || '').toLowerCase();
+if(tag !== 'input' || ty !== 'file') return { ok:false, why:'NOT_FILE_INPUT', tok:curTok, tag:tag, type:el.type || null };
+var c = w2oCenter(el);
+return {
+  ok:true, tok:curTok, ref: REF, selector: w2oCss(el),
+  tag: tag, type: ty, visible: w2oVisible(el),
+  accept: el.getAttribute('accept') || null, multiple: !!el.multiple,
+  name: el.getAttribute('name') || null, id: el.id || null,
+  cx: c.cx, cy: c.cy, snap: w2oSnap(), base: w2oVal(el)
+};
+`;
+}
+
+module.exports = { observeScript, resolveScript, settleScript, findScript, nativeSelectScript, fileInputsScript, fileInputResolveScript };

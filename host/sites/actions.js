@@ -94,6 +94,8 @@ function parseInput(input) {
     // select: value(原生 select 的 option value/文本) 或 option_text(自定义下拉显示文本)
     value: sp.get("value") == null ? null : String(sp.get("value")),
     option_text: sp.get("option_text") == null ? null : String(sp.get("option_text")),
+    // upload: 本地文件路径
+    file_path: sp.get("file_path") == null ? null : String(sp.get("file_path")),
     // run: 多步编排
     steps: raw && Array.isArray(raw.steps) ? raw.steps : null,
     continueOnError: truthy(sp.get("continueOnError") || sp.get("continue_on_error")),
@@ -180,6 +182,19 @@ async function runSelect(p) {
     timeout_ms: p.timeout_ms,
     forceCdp: p.forceCdp,
     splitPress: p.splitPress,
+  });
+}
+
+async function runUpload(p) {
+  return await action.upload({
+    tabId: p.tabId,
+    ref: p.ref,
+    page_token: p.page_token,
+    file_path: p.file_path,
+    expect: p.expect,
+    settle_ms: p.settle_ms,
+    quiet_ms: p.quiet_ms,
+    timeout_ms: p.timeout_ms,
   });
 }
 
@@ -358,6 +373,27 @@ module.exports = {
     },
     {
       method: "POST",
+      path: "/api/v1/act/upload",
+      tool: "browser_upload",
+      operationId: "actUpload",
+      summary: "给文件输入框上传文件并返回 ActionReceipt",
+      description:
+        "给 <input type=file> 塞入本地文件(走 CDP DOM.setFileInputFiles, 与点击/键入不是一条路)。定位: 传 ref(来自 observe/find)则校验该 ref 是文件框并取 selector; 不传 ref 则自动枚举页面文件输入框(0 个报错 / 1 个直接用 / 多个返回候选要求显式传 ref)。参数 file_path 为本地图片绝对路径。上传成功后页面通常会自动跳转(淘宝以图搜同款即如此), 建议传 expect(url) 复核。",
+      example: { file_path: "D:/产品图.jpg", expect: [{ expect: "url", value: "/search" }] },
+      responses: { 200: { description: "ActionReceipt" }, 400: { description: "缺少 file_path" }, 500: { description: "执行失败" } },
+      browser: true,
+      parse: parseInput,
+      run: runUpload,
+      doc: {
+        note: "文件上传(填表单的最后一块)。ref 可省, 省略时自动挑唯一的文件输入框; 多个时回执会列出候选。",
+        curlPost: `curl -s -X POST http://127.0.0.1:8090/api/v1/act/upload \\
+  -H "Content-Type: application/json" \\
+  -d '{"tabId":123,"file_path":"D:/产品图.jpg","expect":[{"expect":"url","value":"/search"}]}'`,
+        slow: true,
+      },
+    },
+    {
+      method: "POST",
       path: "/api/v1/act/run",
       tool: "browser_run",
       operationId: "actRun",
@@ -526,6 +562,26 @@ module.exports = {
       run: runSelect,
     },
     {
+      name: "browser_upload",
+      description:
+        "给页面的文件输入框(<input type=file>)上传本地文件并返回 ActionReceipt(走 CDP DOM.setFileInputFiles)。这是「上传图片/附件」这一表单填写动作的专用通道, 与 browser_type(打字)、browser_select(下拉)不同。定位: 传 ref(来自 browser_observe/browser_find)则校验该 ref 是文件框; 不传 ref 则自动枚举页面文件输入框——0 个会报错(提示可能要先点上传按钮)、1 个直接用、多个会返回候选清单要求显式传 ref。上传成功后页面常会跳转, 建议带 expect 复核。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: { type: "string", description: "本地文件的绝对路径(如 D:/产品图.jpg)" },
+          ref: { type: "string", description: "文件输入框的 ref(可选; 不传则自动挑唯一的文件框)" },
+          tabId: { type: "integer", description: "目标标签页 id; 省略则用当前活动标签" },
+          page_token: { type: "string", description: "browser_observe 返回的 page_token" },
+          expect: EXPECT_SCHEMA,
+          settle_ms: { type: "integer", minimum: 200, maximum: 8000, description: "取证收敛上限(默认 1500)" },
+        },
+        required: ["file_path"],
+        additionalProperties: false,
+      },
+      browser: true,
+      run: runUpload,
+    },
+    {
       name: "browser_run",
       description:
         "多步动作编排: 按顺序执行 steps 数组, 每步独立 ActionReceipt。step.action 支持 observe/find/click/type/select/scroll/drag, 其余字段为该动作参数。默认 fail-fast(任一步失败即停), continueOnError=true 则继续。返回 {ok,total,done,failed_at,steps}。适合把一次自动填表拆成 观察->定位->填入->提交 的序列一次跑完。",
@@ -538,7 +594,7 @@ module.exports = {
             items: {
               type: "object",
               properties: {
-                action: { type: "string", enum: ["observe", "find", "click", "type", "select", "scroll", "drag"] },
+                action: { type: "string", enum: ["observe", "find", "click", "type", "select", "scroll", "drag", "upload"] },
               },
               required: ["action"],
               additionalProperties: true,
